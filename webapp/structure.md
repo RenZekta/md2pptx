@@ -34,8 +34,8 @@ Introductory line.
 Introductory line.
 
 **Key point:**
-- Point one
-- Point two
+1. Point one
+2. Point two
 
 # closing
 The End

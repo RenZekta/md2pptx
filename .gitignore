@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Visual-testing tooling (Playwright install, screenshots)
+tools/

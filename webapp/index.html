@@ -68,6 +68,8 @@
     transition: background .15s ease;
   }
   .btn:hover { background: var(--accent-hover); }
+  .btn-soft { background: #232838; color: var(--ink); border: 1px solid var(--line); }
+  .btn-soft:hover { background: #2c3347; }
   .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 500; }
   .check input { width: 16px; height: 16px; accent-color: var(--accent); }
   .drop {
@@ -110,43 +112,26 @@
         <div class="drop-hint">or click to browse — or paste below</div>
       </div>
       <div class="field" style="margin-top:14px">
-<textarea id="mdtext" spellcheck="false">---
-body_size: 18
----
-
-# title
-Topic: <Presentation topic>
+<textarea id="mdtext" spellcheck="false" placeholder="# title
+The presentation topic
 
 # plan
-1. Section one
-2. Section two
-3. Section three
+1. First section
+2. Second section
+3. Third section
 
 # slide
-## Section one
-A level-zero line of body text.
-
-**Key point:**
-- first example
-- second example
+## First section
+Intro line
+- First point
+- Second point
 
 # slide
-## Section two
-Another introductory line.
-
-- item A
-- item B
-
-# slide
-## Section three
-Yet another line.
-
-- one
-- two
+## Second section
+- First point
 
 # closing
-The End
-</textarea>
+Thank you"></textarea>
       </div>
     </div>
     <div class="stack">
@@ -163,8 +148,10 @@ The End
         <h2>Build</h2>
         <div class="actions">
           <button class="btn" id="build">Build .pptx and download</button>
+          <button class="btn btn-soft" id="copyPrompt">Copy prompt for a model</button>
           <label class="check"><input type="checkbox" id="pdfCb"> PDF preview</label>
         </div>
+        <div class="hint" style="margin-top:8px">Copies the format + deck-quality rules — paste them into a chat model together with your topic to have it write the outline (no example structure in the prompt, so the model isn't pinned to a fixed slide/point count).</div>
       </div>
       <div class="card">
         <h2>Output</h2>
@@ -1002,6 +989,14 @@ if (typeof module !== "undefined" && module.exports) {
     return $("mdtext").value;
   }
 
+  // Output file name: the deck topic, sanitized for all OSes and capped.
+  function deckName(topic) {
+    let t = (topic || "").replace(/[\u0000-\u001f\\/:*?"<>|]/g, " ");
+    t = t.replace(/\s+/g, " ").trim();
+    if (t.length > 80) t = t.slice(0, 80).trim();
+    return (t || "output") + ".pptx";
+  }
+
   async function getTemplateBuffer() {
     const f = $("tmplfile").files[0];
     if (!f) throw new Error("load a template .pptx first");
@@ -1011,6 +1006,67 @@ if (typeof module !== "undefined" && module.exports) {
   $("mdfile").addEventListener("change", async function () {
     const f = this.files[0];
     if (f) $("mdtext").value = await f.text();
+  });
+
+  // ---------------- Copy prompt for a model ----------------
+  // Format + deck-quality rules. The small "# title / <Presentation topic>"
+  // example anchors the # title format; no full outline is included, so the
+  // model is not pinned to a fixed slide/point count. The user gives the
+  // topic in the chat message.
+  const PROMPT_TEXT =
+    "FORMAT RULES\n" +
+    "- Front matter (optional): body_size: <pt> — baseline for plan items, which render at body_size - 1 pt. Body text inherits the template font.\n" +
+    "- Sections, in presentation order: exactly one \"# title\"; at most one \"# plan\"; one or more \"# slide\"; at most one \"# closing\".\n" +
+    "- # title: the topic text only (one line below the # title).\n" +
+    "\n" +
+    "# title\n" +
+    "<Presentation topic>\n" +
+    "\n" +
+    "- # plan: a numbered list, one item per line: 1., 2., 3.\n" +
+    "- # slide: ## <text> is the slide title. Body lines: a plain line (column 0) = level 0 (no bullet); \"- \" = level 1 bullet; \"1. <text>\" = level 1 bullet with the number kept in the text.\n" +
+    "- **bold** marks a bold run within a line.\n\n" +
+    "DECK QUALITY RULES\n" +
+    "- Use only the slide types above.\n" +
+    "- Plan items: a numbered list, not bullets.\n" +
+    "- Bold key labels with **bold**.\n" +
+    "- Citations: cite a statute/article by number AND by the point that enumerates points (e.g. \u0447. 1 \u0441\u0442. 56 \u0423\u041A \u0420\u0424, \u043f. 2 \u0441\u0442. 401 \u0413\u041A \u0420\u0424, U.S. Const. art. I, para. 8); never a bare article when a specific part is meant. If a bare article enumerates points, add point numbers (no. N / \u0447. N).\n" +
+    "- No hyperlinks: drop URLs from the source content; fold references into the body text (only use links if explicitly tasked to).\n" +
+    "- One focused idea per slide; the slide count follows the content — no filler, no padding to a fixed number.\n\n" +
+    "Write the complete structure.md for the topic given in the chat and return the finished structure.md only — no commentary around it.";
+
+  function fullPrompt() {
+    // Rules only — the outline itself stays out of the prompt, so the model
+    // is not pinned to an existing outline's slide/point count.
+    return PROMPT_TEXT;
+  }
+
+  function fallbackCopy(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+
+  $("copyPrompt").addEventListener("click", function () {
+    const text = fullPrompt();
+    const done = function (ok) {
+      log(ok ? "Copied the prompt (format + quality rules) to clipboard. Paste it into a chat model together with your topic."
+             : "Clipboard copy failed — copy the prompt text from the page source, then paste it with your topic.");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { done(true); },
+        function () { done(fallbackCopy(text)); }
+      );
+    } else {
+      done(fallbackCopy(text));
+    }
   });
 
   // Wire each drag-and-drop dropzone to its hidden file input.
@@ -1049,29 +1105,43 @@ if (typeof module !== "undefined" && module.exports) {
       const built = await buildZip(buf, doc);
       const zip = built.zip;
       const bodyPt = built.bodyPt;
-      const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-      const specs = slideSpecs(doc);
+      // Name the blob with the real PPTX MIME type: JSZip's default
+      // ("application/zip") makes some mobile browsers (e.g. Android
+      // Chrome) append a ".zip" extension to the download name.
+      const PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+      const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: PPTX_MIME });
       const count = 1 + (doc.plan ? 1 : 0) + doc.slides.length + (doc.closing ? 1 : 0);
 
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = "output.pptx";
+      a.download = deckName(doc.title);
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
 
-      log("Built output.pptx (" + blob.size + " bytes) with " + count +
+      log("Built " + a.download + " (" + blob.size + " bytes) with " + count +
         " slides (body = template (est. " + bodyPt + " pt), plan items " + doc.TOC +
         " pt (body_size " + doc.bodySize + ")). Downloaded.");
 
-      if ($("pdfCb").checked) await makePreview(doc, bodyPt);
+      if ($("pdfCb").checked) {
+        let scenes = null;
+        try {
+          scenes = await templateScene(zip);
+        } catch (e) {
+          log("Template scene parse failed (" + e.message + ") — plain preview.");
+        }
+        await makePreview(doc, bodyPt, scenes);
+      }
     } catch (e) {
       log("ERROR: " + (e && e.message ? e.message : String(e)));
     }
   });
 
-  // ---------------- PDF preview (approximate canvas render) ----------------
+  // ---------------- PDF preview ----------------
+  // With a parsed template scene the slide is drawn from the template's own
+  // background, shapes and placeholder geometry; without one (scene === null)
+  // it falls back to the plain white-slide render (used by the Node hook).
 
   function fontPx(pt, pxPerInch) { return (pt / 72) * pxPerInch; }
   function fontCss(sizePx, bold) { return (bold ? "bold " : "") + sizePx + "px 'Times New Roman', serif"; }
@@ -1081,7 +1151,12 @@ if (typeof module !== "undefined" && module.exports) {
     const lineHeight = sizePx * 1.22;
     const bullet = level === 1;
     let cx = x, cy = y;
-    if (bullet) { ctx.font = fontCss(sizePx, false); cx += ctx.measureText("•  ").width; }
+    if (bullet) {
+      // bullet glyph on the first line only; wrapped lines get the indent
+      ctx.font = fontCss(sizePx, false);
+      ctx.fillText("•", x, y);
+      cx += ctx.measureText("•  ").width;
+    }
     for (const r of runs) {
       const text = r[0], bold = r[1];
       ctx.font = fontCss(sizePx, bold);
@@ -1098,14 +1173,672 @@ if (typeof module !== "undefined" && module.exports) {
     return cy + lineHeight;
   }
 
-  function renderSlide(spec, pxW, pxH) {
+  // Wrap centered text within maxW into lines.
+  function wrapCentered(ctx, text, maxW) {
+    const words = text.split(/\s+/);
+    const lines = [];
+    let cur = "";
+    for (const w of words) {
+      const t = cur ? cur + " " + w : w;
+      if (!cur || ctx.measureText(t).width <= maxW) cur = t;
+      else { lines.push(cur); cur = w; }
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+
+  // ---------------- Template-aware PDF preview ----------------
+  // Parse the template (slide master + each slide's layout + slides 1-4)
+  // into a lightweight scene — background image, freeform shapes with
+  // their fills/runs, placeholder geometry and text styles — and draw the
+  // canvas slide from it, so the preview matches the .pptx rendered in
+  // PowerPoint instead of a plain white slide.
+
+  const P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main";
+  const A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main";
+  const R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+  function parseTheme(xml) {
+    const out = { colors: {}, majorFont: null, minorFont: null };
+    if (!xml) return out;
+    const cs = xml.match(/<a:clrScheme[\s\S]*?<\/a:clrScheme>/);
+    if (cs) {
+      const block = cs[0];
+      const names = ["dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6"];
+      for (const n of names) {
+        const m = block.match(new RegExp("<a:" + n + ">([\\s\\S]*?)</a:" + n + ">"));
+        if (!m) continue;
+        const c = m[1].match(/srgbClr val="([0-9A-Fa-f]{6})"/) || m[1].match(/lastClr="([0-9A-Fa-f]{6})"/);
+        if (c) out.colors[n] = c[1];
+      }
+    }
+    const major = xml.match(/<a:majorFont>([\s\S]*?)<\/a:majorFont>/);
+    if (major) { const l = major[1].match(/<a:latin typeface="([^"]+)"/); if (l && l[1]) out.majorFont = l[1]; }
+    const minor = xml.match(/<a:minorFont>([\s\S]*?)<\/a:minorFont>/);
+    if (minor) { const l = minor[1].match(/<a:latin typeface="([^"]+)"/); if (l && l[1]) out.minorFont = l[1]; }
+    return out;
+  }
+
+  const SCHEME_TO = { tx1: "dk1", tx2: "dk2", bg1: "lt1", bg2: "lt2" };
+  function mixColor(a, b, t) {
+    const pa = [parseInt(a.slice(0, 2), 16), parseInt(a.slice(2, 4), 16), parseInt(a.slice(4, 6), 16)];
+    const pb = [parseInt(b.slice(0, 2), 16), parseInt(b.slice(2, 4), 16), parseInt(b.slice(4, 6), 16)];
+    return pa.map(function (v, i) { return Math.round(v + (pb[i] - v) * t).toString(16).padStart(2, "0"); }).join("");
+  }
+
+  function fillColorOf(fillEl, theme) {
+    const s = fillEl.getElementsByTagNameNS(A_NS, "srgbClr")[0];
+    if (s) return "#" + (s.getAttribute("val") || "000000").toUpperCase();
+    const sc = fillEl.getElementsByTagNameNS(A_NS, "schemeClr")[0];
+    if (!sc) return null;
+    const name = sc.getAttribute("val");
+    const hex = theme && theme.colors[SCHEME_TO[name] || name];
+    let c = hex ? hex.toUpperCase() : "000000";
+    const tint = sc.getElementsByTagNameNS(A_NS, "tint")[0];
+    const shade = sc.getElementsByTagNameNS(A_NS, "shade")[0];
+    if (tint) c = mixColor(c, "FFFFFF", +tint.getAttribute("val") / 100000);
+    if (shade) c = mixColor(c, "000000", +shade.getAttribute("val") / 100000);
+    return "#" + c;
+  }
+
+  function runProps(rPr, def, fontFallback) {
+    const run = { text: "", bold: false, szPt: null, color: null, font: null, u: false };
+    const apply = function (el) {
+      if (!el) return;
+      const sz = el.getAttribute("sz");
+      if (sz) run.szPt = +sz / 100;
+      if (el.getAttribute("b") === "1") run.bold = true;
+      if (el.getAttribute("u") === "sng" || el.getAttribute("u") === "dbl") run.u = true;
+      const sf = el.getElementsByTagNameNS(A_NS, "solidFill")[0];
+      if (sf) run.color = fillColorOf(sf, null);
+      const lat = el.getElementsByTagNameNS(A_NS, "latin")[0];
+      if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") run.font = t; }
+    };
+    apply(def);
+    apply(rPr);
+    if (!run.szPt) run.szPt = 18;
+    if (!run.color) run.color = "#000000";
+    if (!run.font) run.font = fontFallback;
+    return run;
+  }
+
+  function parseShape(el, dx, dy, fontFallback) {
+    const sh = { kind: "sp", x: 0, y: 0, w: 0, h: 0, fill: null,
+                 ph: null, phKey: null, hasGeom: false,
+                 anchor: null, ins: { l: 91440, t: 45720, r: 91440, b: 45720 },
+                 defaultFont: null, paras: [] };
+    // Note: p:spPr / p:txBody are in the presentationml namespace; their
+    // children (a:xfrm, a:bodyPr, a:p, ...) are in the drawingml namespace.
+    const spPr = el.getElementsByTagNameNS(P_NS, "spPr")[0];
+    if (spPr) {
+      const xfrm = spPr.getElementsByTagNameNS(A_NS, "xfrm")[0];
+      if (xfrm) {
+        const off = xfrm.getElementsByTagNameNS(A_NS, "off")[0];
+        const ext = xfrm.getElementsByTagNameNS(A_NS, "ext")[0];
+        if (off && ext) {
+          sh.x = +off.getAttribute("x") + dx;
+          sh.y = +off.getAttribute("y") + dy;
+          sh.w = +ext.getAttribute("cx");
+          sh.h = +ext.getAttribute("cy");
+          sh.hasGeom = true;
+        }
+      }
+      const sf = spPr.getElementsByTagNameNS(A_NS, "solidFill")[0];
+      if (sf) sh.fill = fillColorOf(sf, null);
+      else {
+        const gf = spPr.getElementsByTagNameNS(A_NS, "gradFill")[0];
+        if (gf) {
+          const gs = gf.getElementsByTagNameNS(A_NS, "gs")[0];
+          if (gs) sh.fill = fillColorOf(gs, null);
+        }
+      }
+    }
+    const ph = el.getElementsByTagNameNS(P_NS, "ph")[0];
+    if (ph) {
+      const type = ph.getAttribute("type");
+      const idx = ph.getAttribute("idx");
+      if (type === "title") { sh.ph = "title"; sh.phKey = "title"; }
+      else if (type) { sh.ph = type; sh.phKey = type; }
+      else if (idx) { sh.ph = "body"; sh.phKey = "idx" + idx; }
+    }
+    const bodyPr = el.getElementsByTagNameNS(A_NS, "bodyPr")[0];
+    if (bodyPr) {
+      const a = bodyPr.getAttribute("anchor");
+      if (a) sh.anchor = a;
+      sh.ins = {
+        l: +(bodyPr.getAttribute("lIns") || 91440),
+        t: +(bodyPr.getAttribute("tIns") || 45720),
+        r: +(bodyPr.getAttribute("rIns") || 91440),
+        b: +(bodyPr.getAttribute("bIns") || 45720),
+      };
+    }
+    const txBody = el.getElementsByTagNameNS(P_NS, "txBody")[0];
+    if (txBody) {
+      const lst = txBody.getElementsByTagNameNS(A_NS, "lstStyle")[0];
+      if (lst) {
+        const lvl1 = lst.getElementsByTagNameNS(A_NS, "lvl1pPr")[0];
+        const def = lvl1 ? lvl1.getElementsByTagNameNS(A_NS, "defRPr")[0] : null;
+        const lat = def ? def.getElementsByTagNameNS(A_NS, "latin")[0] : null;
+        if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") sh.defaultFont = t; }
+      }
+      for (const p of txBody.getElementsByTagNameNS(A_NS, "p")) {
+        const pPr = p.getElementsByTagNameNS(A_NS, "pPr")[0];
+        const runs = [];
+        for (const r of p.getElementsByTagNameNS(A_NS, "r")) {
+          const t = r.getElementsByTagNameNS(A_NS, "t")[0];
+          if (!t || !t.textContent) continue;
+          const rPr = r.getElementsByTagNameNS(A_NS, "rPr")[0];
+          const def = pPr ? pPr.getElementsByTagNameNS(A_NS, "defRPr")[0] : null;
+          const run = runProps(rPr, def, sh.defaultFont || fontFallback || "Times New Roman");
+          run.text = t.textContent;
+          runs.push(run);
+        }
+        if (runs.length) {
+          sh.paras.push({
+            lvl: pPr ? +(pPr.getAttribute("lvl") || 0) : 0,
+            algn: pPr ? (pPr.getAttribute("algn") || "l") : "l",
+            hasPPr: !!pPr,
+            marL: pPr ? +(pPr.getAttribute("marL") || 0) : 0,
+            indent: pPr ? +(pPr.getAttribute("indent") || 0) : 0,
+            bullet: pPr && pPr.getElementsByTagNameNS(A_NS, "buChar")[0]
+              ? pPr.getElementsByTagNameNS(A_NS, "buChar")[0].getAttribute("char") : null,
+            runs: runs,
+          });
+        }
+      }
+    }
+    return sh;
+  }
+
+  function parsePic(el, dx, dy) {
+    const sh = { kind: "pic", x: 0, y: 0, w: 0, h: 0, img: null, rId: null };
+    const spPr = el.getElementsByTagNameNS(P_NS, "spPr")[0];
+    const xfrm = spPr ? spPr.getElementsByTagNameNS(A_NS, "xfrm")[0] : null;
+    if (xfrm) {
+      const off = xfrm.getElementsByTagNameNS(A_NS, "off")[0];
+      const ext = xfrm.getElementsByTagNameNS(A_NS, "ext")[0];
+      if (off) { sh.x = +off.getAttribute("x") + dx; sh.y = +off.getAttribute("y") + dy; }
+      if (ext) { sh.w = +ext.getAttribute("cx"); sh.h = +ext.getAttribute("cy"); }
+    }
+    const blip = el.getElementsByTagNameNS(A_NS, "blip")[0];
+    if (blip) sh.rId = blip.getAttributeNS(REL_EMBED, "embed");
+    return sh;
+  }
+
+  function walkShapes(parent, out, dx, dy, fontFallback) {
+    for (const ch of Array.from(parent.children)) {
+      const ln = ch.localName;
+      if (ln === "sp") out.push(parseShape(ch, dx, dy, fontFallback));
+      else if (ln === "pic") out.push(parsePic(ch, dx, dy));
+      else if (ln === "grpSp") {
+        let ox = 0, oy = 0;
+        const xfrm = ch.getElementsByTagNameNS(A_NS, "xfrm")[0];
+        if (xfrm) {
+          const off = xfrm.getElementsByTagNameNS(A_NS, "off")[0];
+          if (off) { ox = +off.getAttribute("x"); oy = +off.getAttribute("y"); }
+        }
+        walkShapes(ch, out, dx + ox, dy + oy, fontFallback);
+      }
+    }
+  }
+
+  function parseBg(cSld) {
+    const bg = cSld.getElementsByTagNameNS(P_NS, "bg")[0];
+    if (!bg) return null;
+    const sf = bg.getElementsByTagNameNS(A_NS, "solidFill")[0];
+    if (sf) return { kind: "color", color: fillColorOf(sf, null) || "#FFFFFF" };
+    const blip = bg.getElementsByTagNameNS(A_NS, "blip")[0];
+    if (blip) {
+      const rId = blip.getAttributeNS(R_NS, "embed");
+      if (rId) return { kind: "img", rId: rId };
+    }
+    return null;
+  }
+
+  function txStyleOf(ts, name) {
+    const el = ts.getElementsByTagNameNS(P_NS, name)[0];
+    if (!el) return null;
+    const out = { szPt: 18, bold: false, algn: "l", font: null,
+                   lvl1: { marL: 0, indent: 0, bullet: null },
+                   lvl2: { marL: 0, indent: 0, bullet: null } };
+    const readLvl = function (lvlEl, dst) {
+      if (!lvlEl) return;
+      const a = lvlEl.getAttribute("algn");
+      if (a) dst.algn = a;
+      dst.marL = +(lvlEl.getAttribute("marL") || 0);
+      dst.indent = +(lvlEl.getAttribute("indent") || 0);
+      const bu = lvlEl.getElementsByTagNameNS(A_NS, "buChar")[0];
+      if (bu) dst.bullet = bu.getAttribute("char");
+      const d = lvlEl.getElementsByTagNameNS(A_NS, "defRPr")[0];
+      if (d) {
+        const sz = d.getAttribute("sz");
+        if (sz) dst.szPt = +sz / 100;
+        if (d.getAttribute("b") === "1") dst.bold = true;
+        const lat = d.getElementsByTagNameNS(A_NS, "latin")[0];
+        if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") dst.font = t; }
+      }
+    };
+    readLvl(el.getElementsByTagNameNS(A_NS, "lvl1pPr")[0], out);
+    const l2 = el.getElementsByTagNameNS(A_NS, "lvl2pPr")[0];
+    if (l2) readLvl(l2, out.lvl2);
+    return out;
+  }
+
+  function parseSlideXml(xmlText, fontFallback) {
+    const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+    const out = { bg: null, shapes: [], title: null, body: null };
+    const cSld = doc.getElementsByTagNameNS(P_NS, "cSld")[0];
+    if (!cSld) return out;
+    out.bg = parseBg(cSld);
+    const tree = cSld.getElementsByTagNameNS(P_NS, "spTree")[0];
+    if (tree) walkShapes(tree, out.shapes, 0, 0, fontFallback);
+    const ts = doc.getElementsByTagNameNS(P_NS, "txStyles")[0];
+    if (ts) {
+      out.title = txStyleOf(ts, "titleStyle");
+      out.body = txStyleOf(ts, "bodyStyle");
+    }
+    return out;
+  }
+
+  async function zipText(zip, name) {
+    try {
+      const f = zip.file(name);
+      return f ? await f.async("string") : null;
+    } catch (e) { return null; }
+  }
+
+  function relTarget(relsText, kind) {
+    if (!relsText) return null;
+    const m = relsText.match(new RegExp('<Relationship[^>]*Type="[^"]*\\/' + kind + '"[^>]*Target="([^"]+)"'));
+    if (!m) return null;
+    let t = m[1];
+    if (t[0] === "/") t = t.slice(1);
+    else t = "ppt/" + t.replace(/^(\.\.\/)+/, "");
+    return t;
+  }
+
+  async function loadBlip(zip, relsText, rId) {
+    if (!rId || !relsText) return null;
+    const m = relsText.match(new RegExp('<Relationship[^>]*Id="' + rId + '"[^>]*Target="([^"]+)"'));
+    if (!m) return null;
+    let target = m[1];
+    if (target[0] === "/") target = target.slice(1);
+    else target = "ppt/" + target.replace(/^(\.\.\/)+/, "");
+    let file;
+    try { file = zip.file(target); } catch (e) { file = null; }
+    if (!file) return null;
+    const b64 = await file.async("base64");
+    const ext = (target.split(".").pop() || "").toLowerCase();
+    const mime = ext === "png" ? "image/png"
+      : ext === "jpg" || ext === "jpeg" ? "image/jpeg"
+      : ext === "gif" ? "image/gif"
+      : ext === "svg" ? "image/svg+xml"
+      : "image/png";
+    const url = "data:" + mime + ";base64," + b64;
+    if (typeof Image === "undefined") return null;
+    const img = new Image();
+    return new Promise(function (res) {
+      img.onload = function () { res(img); };
+      img.onerror = function () { res(null); };
+      img.src = url;
+    });
+  }
+
+  // Parse slides 1-4 of the loaded template into per-slide scenes:
+  // background, freeform shapes (master + layout + slide), placeholder
+  // geometry (slide -> layout -> master) and placeholder text styles.
+  async function templateScene(zip) {
+    const theme = parseTheme(await zipText(zip, "ppt/theme/theme1.xml"));
+    const fontFallback = theme.minorFont || "Times New Roman";
+
+    const masterXml = await zipText(zip, "ppt/slideMasters/slideMaster1.xml");
+    if (!masterXml) throw new Error("template has no slide master");
+    const masterRels = await zipText(zip, "ppt/slideMasters/_rels/slideMaster1.xml.rels");
+    const master = parseSlideXml(masterXml, fontFallback);
+
+    const scenes = [];
+    for (let i = 1; i <= 4; i++) {
+      const slideXml = await zipText(zip, "ppt/slides/slide" + i + ".xml");
+      if (!slideXml) throw new Error("template has no slide " + i);
+      const slideRels = await zipText(zip, "ppt/slides/_rels/slide" + i + ".xml.rels");
+      const layoutName = relTarget(slideRels, "slideLayout");
+      const layoutXml = layoutName ? await zipText(zip, layoutName) : null;
+      const layoutRels = layoutName ? await zipText(zip, layoutName.slice(0, -4) + ".xml.rels") : null;
+      const layout = layoutXml ? parseSlideXml(layoutXml, fontFallback) : null;
+      const slide = parseSlideXml(slideXml, fontFallback);
+
+      const scene = {
+        idx: i, bg: null, shapes: [],
+        title: master.title || { szPt: 20, bold: true, algn: "ctr", font: null },
+        body: master.body || { szPt: 18, bold: false, algn: "l", font: null },
+        bodyLvl0: (master.body && master.body.lvl1) || { marL: 0, indent: 540000, bullet: null },
+        bodyLvl1: (master.body && master.body.lvl2) || { marL: 742960, indent: 540000, bullet: "\u2013" },
+        fontFallback: fontFallback,
+      };
+
+      // Background: slide, then layout, then master.
+      const relsFor = { slide: slideRels, layout: layoutRels, master: masterRels };
+      for (const key of ["slide", "layout", "master"]) {
+        const src = key === "slide" ? slide : key === "layout" ? layout : master;
+        if (src && src.bg) {
+          if (src.bg.kind === "color") { scene.bg = src.bg; break; }
+          const img = await loadBlip(zip, relsFor[key], src.bg.rId);
+          if (img) { scene.bg = { kind: "img", img: img }; break; }
+        }
+      }
+      if (!scene.bg) scene.bg = { kind: "color", color: "#FFFFFF" };
+
+      // Drawing order: master freeform, layout freeform, then all slide shapes.
+      for (const src of [master, layout]) {
+        if (!src) continue;
+        for (const sh of src.shapes) if (!sh.ph) scene.shapes.push(sh);
+      }
+      const phs = [];
+      for (const sh of slide.shapes) {
+        scene.shapes.push(sh);
+        if (sh.ph) phs.push(sh);
+      }
+
+      // Placeholder geometry: slide -> layout -> master.
+      const phOf = function (src, key) {
+        if (!src) return null;
+        for (const s of src.shapes) if (s.phKey === key) return s;
+        return null;
+      };
+      // A body placeholder is declared either <p:ph idx="1"/> (phKey "idx1")
+      // or <p:ph type="body" idx="1"/> (phKey "body") — alias the two.
+      for (const sh of phs) {
+        if (sh.hasGeom) continue;
+        const keys = sh.phKey.indexOf("idx") === 0 ? [sh.phKey, "body"] : [sh.phKey];
+        let base = null;
+        for (const src of [layout, master]) {
+          let c = null;
+          for (const k of keys) {
+            c = phOf(src, k);
+            if (c && c.hasGeom) break;
+          }
+          if (c) { base = c; break; }
+        }
+        if (base) {
+          sh.x = base.x; sh.y = base.y; sh.w = base.w; sh.h = base.h;
+          sh.anchor = base.anchor;
+          sh.ins = base.ins;
+        }
+      }
+
+      // bodyPr anchor inheritance: slide -> layout -> master (OOXML: an
+      // anchor unset at one level is inherited from the level above).
+      for (const sh of phs) {
+        if (sh.anchor) continue;
+        const keys = sh.phKey.indexOf("idx") === 0 ? [sh.phKey, "body"] : [sh.phKey];
+        for (const src of [layout, master]) {
+          for (const k of keys) {
+            const c = phOf(src, k);
+            if (c && c.anchor) { sh.anchor = c.anchor; break; }
+          }
+          if (sh.anchor) break;
+        }
+      }
+
+      // Placeholder text fonts: the layout's lstStyle, then the master's
+      // txStyles (the template's real title/body font), then the theme.
+      const lTitle = phOf(layout, "title");
+      const lBody = phOf(layout, "idx1");
+      scene.title.font = (lTitle && lTitle.defaultFont) || scene.title.font || theme.majorFont || fontFallback;
+      scene.body.font = (lBody && lBody.defaultFont) || scene.body.font || theme.minorFont || fontFallback;
+
+      // Title slide: the shape carrying the topic anchor gets its paragraph
+      // replaced by the deck topic when drawing (as the engine does).
+      if (i === 1) {
+        for (const sh of slide.shapes) {
+          if (sh.ph) continue;
+          const text = sh.paras.map(function (p) {
+            return p.runs.map(function (r) { return r.text; }).join("");
+          }).join("");
+          if (text.indexOf(TITLE_ANCHOR_RU) >= 0) { sh.isTopic = true; sh.topicAnchor = "ru"; }
+          else if (text.indexOf(TITLE_ANCHOR_EN) >= 0) { sh.isTopic = true; sh.topicAnchor = "en"; }
+        }
+      }
+
+      scenes.push(scene);
+    }
+    return scenes;
+  }
+
+  // ---- scene drawing ----
+
+  function fontStr(szPt, bold, font, pxPerInch) {
+    return (bold ? "700 " : "400 ") + (szPt / 72 * pxPerInch) + "px \"" + (font || "Times New Roman") + "\"";
+  }
+
+  function segW(ctx, text, run, pxPerInch) {
+    ctx.font = fontStr(run.szPt, run.bold, run.font, pxPerInch);
+    return ctx.measureText(text).width;
+  }
+
+  function spaceW(ctx, run, pxPerInch) {
+    ctx.font = fontStr(run.szPt, run.bold, run.font, pxPerInch);
+    return ctx.measureText(" ").width;
+  }
+
+  // Draw paragraphs (runs with per-run bold/size/color/underline, wrapping,
+  // bullets, alignment and anchor) inside shape box `sh`.
+  function drawParas(ctx, sh, paras, pxPerInch) {
+    const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
+    const boxL = PX(sh.x) + PX(sh.ins.l);
+    const boxR = PX(sh.x + sh.w) - PX(sh.ins.r);
+    const avail0 = Math.max(40, boxR - boxL);
+    const lineH = function (szPt) { return szPt / 72 * pxPerInch * 1.22; };
+
+    const items = [];
+    let totalH = 0;
+    for (const p of paras) {
+      const r0 = p.runs[0] || { szPt: 18, bold: false, font: null };
+      const lh = lineH(r0.szPt);
+      const bulletX = boxL + PX(p.marL);
+      // OOXML: `indent` shifts the first line only; wrapped lines sit at marL.
+      const lineAvail = function (firstLine) {
+        return Math.max(40, avail0 - PX(p.marL) - (firstLine ? PX(p.indent || 0) : 0));
+      };
+
+      // Words come from ALL runs of the paragraph: adjacent runs stay
+      // together (PowerPoint draws them without a space), explicit spaces
+      // separate words. Each word keeps its run segments for per-run
+      // fonts/bold/underline.
+      const segs = [];
+      for (const r of p.runs) {
+        const toks = r.text.split(/\s+/);
+        for (let i = 0; i < toks.length; i++) {
+          if (i > 0) segs.push({ text: " ", run: r, space: true });
+          if (toks[i]) segs.push({ text: toks[i], run: r, space: false });
+        }
+      }
+      const words = [];
+      let lastWasSpace = true;
+      for (const s of segs) {
+        if (s.space) { lastWasSpace = true; continue; }
+        if (lastWasSpace || !words.length) words.push({ segs: [s], w: 0 });
+        else words[words.length - 1].segs.push(s);
+        lastWasSpace = false;
+      }
+      for (const wd of words) {
+        wd.firstRun = wd.segs[0].run;
+        wd.w = wd.segs.reduce(function (a, s) {
+          return a + segW(ctx, s.text, s.run, pxPerInch);
+        }, 0);
+      }
+      const lines = [];
+      let cur = [];
+      let curW = 0;
+      let li = 0;
+      for (const w of words) {
+        const add = w.w + (cur.length ? spaceW(ctx, w.firstRun, pxPerInch) : 0);
+        if (cur.length && curW + add > lineAvail(li === 0)) { lines.push(cur); cur = []; curW = 0; li++; }
+        cur.push(w);
+        curW += w.w + (cur.length > 1 ? spaceW(ctx, w.firstRun, pxPerInch) : 0);
+      }
+      if (cur.length) lines.push(cur);
+      for (let i = 0; i < lines.length; i++) {
+        items.push({ ln: lines[i], lh: lh, p: p, bulletX: bulletX,
+          textX: bulletX + (i === 0 ? PX(p.indent || 0) : 0), first: i === 0 });
+      }
+      totalH += lines.length * lh;
+    }
+
+    let y = PX(sh.y + sh.ins.t);
+    if (sh.anchor === "ctr") y = PX(sh.y) + Math.max(0, (PX(sh.h) - totalH) / 2);
+    else if (sh.anchor === "b") y = Math.max(PX(sh.y + sh.ins.t), PX(sh.y + sh.h - sh.ins.b) - totalH);
+
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    for (const it of items) {
+      const p = it.p;
+      const lineWidth = it.ln.reduce(function (a, s, i) {
+        return a + s.w + (i > 0 ? spaceW(ctx, s.firstRun, pxPerInch) : 0);
+      }, 0);
+      let x0;
+      if (p.algn === "ctr") x0 = (boxL + boxR) / 2 - lineWidth / 2;
+      else if (p.algn === "r") x0 = boxR - lineWidth;
+      else x0 = it.textX;
+
+      if (p.bullet && it.first) {
+        const b0 = it.ln[0].firstRun;
+        ctx.font = fontStr(b0.szPt, false, b0.font, pxPerInch);
+        ctx.fillStyle = b0.color || "#000000";
+        ctx.fillText(p.bullet, it.bulletX, y);
+      }
+      let x = x0;
+      for (const wd of it.ln) {
+        for (const s of wd.segs) {
+          ctx.font = fontStr(s.run.szPt, s.run.bold, s.run.font, pxPerInch);
+          ctx.fillStyle = s.run.color || "#000000";
+          ctx.fillText(s.text, x, y);
+          const sw = segW(ctx, s.text, s.run, pxPerInch);
+          if (s.run.u) {
+            ctx.strokeStyle = s.run.color || "#000000";
+            ctx.lineWidth = Math.max(1, s.run.szPt / 72 * pxPerInch / 12);
+            const uy = y + s.run.szPt / 72 * pxPerInch * 0.92;
+            ctx.beginPath();
+            ctx.moveTo(x, uy);
+            ctx.lineTo(x + sw, uy);
+            ctx.stroke();
+          }
+          x += sw;
+        }
+        x += spaceW(ctx, wd.firstRun, pxPerInch);
+      }
+      y += it.lh;
+    }
+  }
+
+  function drawPhTitle(ctx, sh, spec, scene, pxPerInch) {
+    const style = scene.title;
+    const r0 = sh.paras[0] && sh.paras[0].runs[0];
+    const szPt = (r0 && r0.szPt) || style.szPt;
+    const bold = (r0 && r0.bold) || style.bold;
+    const p0 = sh.paras[0];
+    const algn = (p0 && p0.hasPPr) ? p0.algn : style.algn;
+    const font = (r0 && r0.font) || style.font || scene.fontFallback;
+    const text = spec.kind === "plan" ? "\u041F\u043B\u0430\u043D" : (spec.title || "");
+    drawParas(ctx, sh, [{ lvl: 0, algn: algn, marL: 0, indent: 0, bullet: null,
+      runs: [{ text: text, bold: bold, szPt: szPt, color: "#000000", font: font, u: false }] }], pxPerInch);
+  }
+
+  function drawPhBody(ctx, sh, spec, scene, pxPerInch) {
+    const font = scene.body.font || scene.fontFallback;
+    const L0 = scene.bodyLvl0;
+    const L1 = scene.bodyLvl1;
+    let paras;
+    if (spec.kind === "plan") {
+      paras = spec.items.map(function (t) {
+        return { lvl: 0, algn: "l", marL: L0.marL, indent: L0.indent, bullet: null,
+          runs: [{ text: t, bold: false, szPt: spec.toc, color: "#000000", font: font, u: false }] };
+      });
+    } else if (spec.body && spec.body.length) {
+      paras = spec.body.map(function (p) {
+        const lvl = p[0];
+        return {
+          lvl: lvl, algn: "l",
+          marL: lvl > 0 ? L1.marL : L0.marL,
+          indent: lvl > 0 ? L1.indent : L0.indent,
+          bullet: lvl > 0 ? (L1.bullet || "\u2022") : null,
+          runs: p[1].map(function (r) {
+            return { text: r[0], bold: r[1], szPt: spec.bodyPt, color: "#000000", font: font, u: false };
+          }),
+        };
+      });
+    }
+    if (paras && paras.length) drawParas(ctx, sh, paras, pxPerInch);
+  }
+
+  function drawSldNum(ctx, sh, spec, pxPerInch) {
+    const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
+    const n = String(spec.page || 1);
+    ctx.font = fontStr(12, false, "Times New Roman", pxPerInch);
+    const w = ctx.measureText(n).width;
+    ctx.fillStyle = "#BFBFBF";
+    ctx.textBaseline = "middle";
+    ctx.fillText(n, PX(sh.x) + PX(sh.w) / 2 - w / 2, PX(sh.y) + PX(sh.h) / 2);
+    ctx.textBaseline = "top";
+  }
+
+  function drawFreeform(ctx, sh, spec, scene, pxPerInch) {
+    let paras = sh.paras;
+    if (spec.kind === "title" && sh.isTopic) {
+      const r0 = sh.paras[0] && sh.paras[0].runs[0];
+      const text = sh.topicAnchor === "ru"
+        ? TITLE_ANCHOR_RU + ": " + (spec.topic || "")
+        : (spec.topic || "");
+      paras = [{ lvl: 0, algn: (sh.paras[0] && sh.paras[0].algn) || "l", marL: 0, indent: 0, bullet: null,
+        runs: [{ text: text, bold: (r0 && r0.bold) || true,
+          szPt: (r0 && r0.szPt) || 18, color: (r0 && r0.color) || "#000000",
+          font: (r0 && r0.font) || scene.fontFallback, u: false }] }];
+    }
+    if (paras.length) drawParas(ctx, sh, paras, pxPerInch);
+  }
+
+  // Draw the slide from a parsed scene: background, freeform shapes and
+  // placeholders with the deck content.
+  function renderScene(ctx, scene, spec, pxW, pxH) {
+    const pxPerInch = pxW / (SLIDE_W / EMU_PER_INCH);
+    if (scene.bg.kind === "img" && scene.bg.img) {
+      ctx.drawImage(scene.bg.img, 0, 0, pxW, pxH);
+    } else {
+      ctx.fillStyle = scene.bg.color || "#ffffff";
+      ctx.fillRect(0, 0, pxW, pxH);
+    }
+    for (const sh of scene.shapes) {
+      if (sh.kind === "pic") {
+        if (sh.img) {
+          const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
+          ctx.drawImage(sh.img, PX(sh.x), PX(sh.y), PX(sh.w), PX(sh.h));
+        }
+        continue;
+      }
+      if (!sh.w || !sh.h) continue;
+      if (sh.fill) {
+        const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
+        ctx.fillStyle = sh.fill;
+        ctx.fillRect(PX(sh.x), PX(sh.y), PX(sh.w), PX(sh.h));
+      }
+      if (sh.ph === "title") drawPhTitle(ctx, sh, spec, scene, pxPerInch);
+      else if (sh.ph === "body") drawPhBody(ctx, sh, spec, scene, pxPerInch);
+      else if (sh.ph === "sldNum") drawSldNum(ctx, sh, spec, pxPerInch);
+      else if (sh.ph === "dt" || sh.ph === "ftr") { /* template-only; skip */ }
+      else drawFreeform(ctx, sh, spec, scene, pxPerInch);
+    }
+  }
+
+  function renderSlide(spec, pxW, pxH, scene) {
     const c = document.createElement("canvas");
     c.width = pxW; c.height = pxH;
     const ctx = c.getContext("2d");
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    if (scene) { renderScene(ctx, scene, spec, pxW, pxH); return c; }
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, pxW, pxH);
     ctx.fillStyle = "#000000";
-    ctx.textBaseline = "top";
     const pxPerInch = pxW / (SLIDE_W / EMU_PER_INCH);
     const emuToPx = function (off) {
       return {
@@ -1117,12 +1850,15 @@ if (typeof module !== "undefined" && module.exports) {
     };
 
     if (spec.kind === "title") {
-      // freeform title slide: approximate (Доклад + topic)
+      // freeform title slide: approximate (Доклад + topic, wrapped)
       ctx.textAlign = "center";
       ctx.font = fontCss(fontPx(44, pxPerInch), true);
-      ctx.fillText("Доклад", pxW / 2, pxH * 0.36);
+      ctx.fillText("Доклад", pxW / 2, pxH * 0.30);
       ctx.font = fontCss(fontPx(18, pxPerInch), true);
-      ctx.fillText(spec.topic, pxW / 2, pxH * 0.58);
+      const tl = wrapCentered(ctx, spec.topic, pxW * 0.85);
+      const tlh = fontPx(18, pxPerInch) * 1.22;
+      let ty = pxH * 0.50 - ((tl.length - 1) * tlh) / 2;
+      for (const ln of tl) { ctx.fillText(ln, pxW / 2, ty); ty += tlh; }
       ctx.textAlign = "left";
     } else if (spec.kind === "plan") {
       const t = emuToPx(CONTENT_TITLE_OFF);
@@ -1145,29 +1881,54 @@ if (typeof module !== "undefined" && module.exports) {
     } else if (spec.kind === "closing") {
       ctx.textAlign = "center";
       ctx.font = fontCss(fontPx(36, pxPerInch), false);
-      ctx.fillText(spec.title, pxW / 2, pxH / 2);
+      const cl = wrapCentered(ctx, spec.title, pxW * 0.85);
+      const clh = fontPx(36, pxPerInch) * 1.22;
+      let cy = pxH / 2 - ((cl.length - 1) * clh) / 2;
+      for (const ln of cl) { ctx.fillText(ln, pxW / 2, cy); cy += clh; }
       ctx.textAlign = "left";
     }
     return c;
   }
 
-  function makePreview(doc, bodyPt) {
+  async function makePreview(doc, bodyPt, scenes) {
     const pxW = 960, pxH = 720; // 10in x 7.5in at 96 px/inch
     const jspdf = window.jspdf;
     if (!jspdf || !jspdf.jsPDF) throw new Error("jsPDF not loaded");
     const pdf = new jspdf.jsPDF({ unit: "in", format: [10, 7.5], orientation: "landscape" });
     const specs = slideSpecs(doc, bodyPt);
     specs.forEach(function (spec, idx) {
+      spec.page = idx + 1;
+      let scene = null;
+      if (scenes) {
+        if (spec.kind === "title") scene = scenes[0];
+        else if (spec.kind === "plan") scene = scenes[1];
+        else if (spec.kind === "closing") scene = scenes[3];
+        else scene = scenes[2]; // every content slide is the template's slide3 type
+      }
       if (idx > 0) pdf.addPage([10, 7.5], "landscape");
-      const c = renderSlide(spec, pxW, pxH);
+      const c = renderSlide(spec, pxW, pxH, scene);
       pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, 10, 7.5);
     });
-    const url = pdf.output("datauristring");
     const f = $("pdf");
+    // Object URL, NOT a data: URL: Chromium blocks data: URLs larger than
+    // ~2 MB in an <iframe> (the preview then shows a white screen, on
+    // desktop and Android alike); object URLs have no such limit.
+    if (f.src && f.src.indexOf("blob:") === 0) URL.revokeObjectURL(f.src);
+    const ab = pdf.output("arraybuffer");
+    const url = URL.createObjectURL(new Blob([ab], { type: "application/pdf" }));
     f.style.display = "block";
     f.src = url;
-    log("PDF preview: " + specs.length + " slides (approximate canvas render — open the .pptx in PowerPoint for the final look).");
+    log("PDF preview: " + specs.length + " slides (canvas render of the template — close to the .pptx; open it in PowerPoint for the final look).");
   }
+
+  // small hook for debugging/testing
+  window.__md2pptx = {
+    deckName: deckName,
+    fullPrompt: fullPrompt,
+    renderSlide: renderSlide,
+    slideSpecs: slideSpecs,
+    templateScene: templateScene,
+  };
 })();
 </script>
 </body>

@@ -3,7 +3,7 @@ body_size: 18
 ---
 
 # title
-Topic: <Presentation topic>
+<Presentation topic>
 
 # plan
 1. Section one

@@ -34,9 +34,12 @@ quality; needs an agent runtime. See `md2pptx/SKILL.md`.
 ### Mode B — standalone web app
 No backend, no agent. A single self-contained `.html` reads a `structure.md` and
 a `template.pptx` entirely in the browser and outputs a downloadable `.pptx`
-(with an optional in-browser PDF preview). The model's only role is
-*learning the conventions* — producing a well-formed `structure.md`; the parser
-enforces the format deterministically.
+named after the deck topic (`<topic>.pptx`), with an optional in-browser PDF
+preview. A **Copy prompt for a model** button copies the format + deck-quality
+rules together with the current `structure.md`, so the outline can be pasted
+into a chat model *with* guidance instead of as a bare file. The model's only
+role is *learning the conventions* — producing a well-formed `structure.md`;
+the parser enforces the format deterministically.
 
 ## The `structure.md` format (the contract)
 

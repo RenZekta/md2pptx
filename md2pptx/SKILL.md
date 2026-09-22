@@ -27,13 +27,15 @@ and you need to produce the finished `.pptx`.
 ## Running the engine
 Exact invocation, arguments in this order:
 
-    python <skill-dir>/engine.py <structure.md> <template.pptx> <output.pptx>
+    python <skill-dir>/engine.py <structure.md> <template.pptx> <output>.pptx
 
 - `<skill-dir>` — this skill's folder (where `SKILL.md` and `engine.py` live).
+- Name the output file after the deck topic — `<topic>.pptx` (the `# title`
+  topic text, sanitized), not a generic `output.pptx`.
 - Exit code `0` = success, `1` = validation failure.
 - The report always goes to stdout; read it every run:
 
-      built <output.pptx>
+      built <topic>.pptx
         slides: N (title + 1 plan + N content + 1 closing)
         fonts: body = template (est. 18 pt), plan items = 17 pt (body_size=18)
         validation: PASSED

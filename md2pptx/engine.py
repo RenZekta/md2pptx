@@ -26,6 +26,11 @@ Design notes
   Plan-slide items are stamped at `body_size - 1` (the engine's plan override);
   the closing title is stamped at the size declared in the template's
   closing-slide title placeholder (fallback 36 pt).
+* Proofing language: generated runs carry no lang unless the structure.md
+  front matter declares `lang: <BCP-47>`; without it PowerPoint falls back to
+  its default proofing language and flags non-English text as "misspelled".
+  When `lang` is declared, every generated run and endParaRPr gets
+  lang="<tag>" dirty="0" (the same stamp PowerPoint puts on pasted runs).
 
 The web app (Mode B) in webapp/index.html implements the same pipeline as a
 self-contained page and shares the template font preservation behavior
@@ -99,15 +104,20 @@ def parse_bold(text):
     return runs
 
 
-def _rpr(bold, sz=None):
+def _rpr(bold, sz=None, lang=None):
     """Run properties. `sz` is in hundredths of a point; when omitted the
-    run inherits the template font size. No lang is stamped: language is
-    inherited from the template too."""
+    run inherits the template font size. `lang` (BCP-47, from the
+    structure.md front matter) stamps lang + dirty="0" so PowerPoint does
+    not fall back to its default proofing language and flag the text as
+    misspelled."""
     attrs = []
     if sz:
         attrs.append('sz="%d"' % sz)
     if bold:
         attrs.append('b="1"')
+    if lang:
+        attrs.append('lang="%s"' % lang)
+        attrs.append('dirty="0"')
     return "<a:rPr%s/>" % ((" " + " ".join(attrs)) if attrs else "")
 
 
@@ -127,12 +137,15 @@ def first_rpr(xml, marker):
     return m.group(0) if m else None
 
 
-def merge_rpr(base, bold=None, sz=None):
+def merge_rpr(base, bold=None, sz=None, lang=None):
     """Build an rPr from the original run's rPr (`base`): keeps its typeface
-    child elements and lang; stamps `bold`/`sz` (sz in hundredths of a
-    point), overriding any stamped in `base`."""
+    child elements; stamps `bold`/`sz` (sz in hundredths of a point),
+    overriding any stamped in `base`. When `lang` is given, any `lang`/
+    `dirty` attrs stamped in `base` are replaced by `lang` + dirty="0" so
+    PowerPoint proves the run in the declared language instead of its
+    default."""
     if not base:
-        return _rpr(bold, sz)
+        return _rpr(bold, sz, lang)
     if base.endswith("/>"):
         attrs = base[6:-2].strip()
         children = ""
@@ -145,38 +158,56 @@ def merge_rpr(base, bold=None, sz=None):
     attrs = re.sub(r'\bb="1"', "", attrs)
     extra = []
     if sz:
-        extra.append(' sz="%d"' % sz)
+        extra.append('sz="%d"' % sz)
     if bold:
-        extra.append(' b="1"')
-    a = (attrs + " ".join(extra)).strip()
+        extra.append('b="1"')
+    if lang:
+        attrs = re.sub(r'\blang="[^"]*"', "", attrs)
+        attrs = re.sub(r'\bdirty="[^"]*"', "", attrs)
+        extra.append('lang="%s"' % lang)
+        extra.append('dirty="0"')
+    a = (attrs + (" " + " ".join(extra) if extra else "")).strip()
     prefix = "<a:rPr" + (" " + a if a else "")
     if children:
         return prefix + ">" + children + "</a:rPr>"
     return prefix + "/>"
 
 
-def para(level, runs, sz=None, base=None):
+def endpara_rpr(lang=None):
+    """<a:endParaRPr/> end mark of a paragraph. When `lang` is given it
+    carries lang + dirty="0" too (PowerPoint stamps both on paste; a bare
+    end mark would leave the paragraph's proofing language at the
+    default)."""
+    if lang:
+        return '<a:endParaRPr lang="%s" dirty="0"/>' % lang
+    return "<a:endParaRPr/>"
+
+
+def para(level, runs, sz=None, base=None, lang=None):
     """Body paragraph at `level` (0 = plain line, 1 = bullet). The font size
     is stamped only when `sz` is given; otherwise runs inherit the
     template's body font. `base` is the original paragraph's first-run rPr:
-    its typeface elements (a:latin/a:cs/a:ea) and lang are kept on every
-    new run so the replaced text keeps the template's font."""
+    its typeface elements (a:latin/a:cs/a:ea) are kept on every new run so
+    the replaced text keeps the template's font. `lang` (BCP-47) is stamped
+    on every run and the end mark so PowerPoint does not flag the text."""
     ppr = '<a:pPr lvl="%d"/>' % level
-    rs = "".join('<a:r>%s<a:t>%s</a:t></a:r>' % (merge_rpr(base, b, sz), esc(t))
-                  for (t, b) in runs)
-    return '<a:p>%s%s<a:endParaRPr/></a:p>' % (ppr, rs)
+    rs = "".join('<a:r>%s<a:t>%s</a:t></a:r>'
+                 % (merge_rpr(base, b, sz, lang), esc(t)) for (t, b) in runs)
+    return '<a:p>%s%s%s</a:p>' % (ppr, rs, endpara_rpr(lang))
 
 
-def title_para(text, sz=None, base=None):
+def title_para(text, sz=None, base=None, lang=None):
     """`sz` is in points (stamped as hundredths, like the template does)."""
-    return ('<a:p><a:r>%s<a:t>%s</a:t></a:r><a:endParaRPr/></a:p>'
-            % (merge_rpr(base, False, sz * 100 if sz else None), esc(text)))
+    return ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
+            % (merge_rpr(base, False, sz * 100 if sz else None, lang),
+               esc(text), endpara_rpr(lang)))
 
 
-def toc_para(text, sz, base=None):
+def toc_para(text, sz, base=None, lang=None):
     return ('<a:p><a:pPr lvl="0"/>'
-            '<a:r>%s<a:t>%s</a:t></a:r>'
-            '<a:endParaRPr/></a:p>' % (merge_rpr(base, False, sz * 100), esc(text)))
+            '<a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
+            % (merge_rpr(base, False, sz * 100, lang), esc(text),
+               endpara_rpr(lang)))
 
 
 def set_block_paras(xml, marker, new_paras):
@@ -223,6 +254,7 @@ def parse_md(text):
     n = len(lines)
     i = 0
     body_size = 18
+    lang = None
     if n and lines[0].strip() == "---":
         i = 1
         fm = {}
@@ -237,8 +269,16 @@ def parse_md(text):
             body_size = int(fm.get("body_size", "18"))
         except ValueError:
             body_size = 18
+        lang_in = fm.get("lang", "").strip()
+        if lang_in:
+            if not re.match(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$", lang_in):
+                raise SystemExit(
+                    "ERROR: invalid lang %r in structure.md front matter "
+                    "(expected a BCP-47 tag like ru-RU)" % lang_in)
+            lang = lang_in
     # body_size now only drives the plan slide: items render at body_size - 1.
     # Body text takes its size from the template (see resolve_body_size).
+    # `lang`, when declared, is stamped on every generated run and end mark.
     TOC = body_size - 1
 
     sections = []
@@ -253,7 +293,7 @@ def parse_md(text):
     if cur is not None:
         sections.append(cur)
 
-    doc = {"body_size": body_size, "TOC": TOC,
+    doc = {"body_size": body_size, "TOC": TOC, "lang": lang,
            "title": None, "plan": None, "slides": [], "closing": None}
     for header, body in sections:
         if header == "title":
@@ -373,8 +413,9 @@ def build(structure_text, template_path, out_path):
     anchor = topic_anchor(title_xml)
     topic_text = (anchor + ": " + topic) if anchor == TITLE_ANCHOR_RU else topic
     topic_base = first_rpr(title_xml, anchor)
-    topic_para = ('<a:p><a:r>%s<a:t>%s</a:t></a:r><a:endParaRPr/></a:p>'
-                  % (merge_rpr(topic_base, True), esc(topic_text)))
+    topic_para = ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
+                  % (merge_rpr(topic_base, True, None, doc["lang"]),
+                     esc(topic_text), endpara_rpr(doc["lang"])))
     title_xml = replace_para(title_xml, anchor, topic_para)
     parts[TITLE_SLIDE] = title_xml.encode("utf-8")
 
@@ -383,10 +424,12 @@ def build(structure_text, template_path, out_path):
         plan_xml = parts[PLAN_SLIDE].decode("utf-8")
         plan_title_base = first_rpr(plan_xml, TITLE_MARKER)
         plan_xml = set_block_paras(plan_xml, TITLE_MARKER,
-                                  title_para("План", base=plan_title_base))
+                                  title_para("План", base=plan_title_base,
+                                            lang=doc["lang"]))
         plan_body_base = first_rpr(plan_xml, BODY_MARKER)
         plan_xml = set_block_paras(plan_xml, BODY_MARKER,
-                                  "".join(toc_para(t, TOC, base=plan_body_base)
+                                  "".join(toc_para(t, TOC, base=plan_body_base,
+                                                 lang=doc["lang"])
                                          for t in doc["plan"]))
         parts[PLAN_SLIDE] = plan_xml.encode("utf-8")
 
@@ -398,10 +441,11 @@ def build(structure_text, template_path, out_path):
         x = parts[fn].decode("utf-8")
         ct_base = first_rpr(x, TITLE_MARKER)
         x = set_block_paras(x, TITLE_MARKER,
-                           title_para(stitle or "", base=ct_base))
+                           title_para(stitle or "", base=ct_base,
+                                     lang=doc["lang"]))
         cb_base = first_rpr(x, BODY_MARKER)
         x = set_block_paras(x, BODY_MARKER,
-                           "".join(para(lv, runs, base=cb_base)
+                           "".join(para(lv, runs, base=cb_base, lang=doc["lang"])
                                   for lv, runs in parsed))
         parts[fn] = x.encode("utf-8")
 
@@ -412,7 +456,8 @@ def build(structure_text, template_path, out_path):
         close_base = first_rpr(close_xml, TITLE_MARKER)
         close_xml = set_block_paras(close_xml, TITLE_MARKER,
                                     title_para(doc["closing"], sz=close_sz,
-                                              base=close_base))
+                                              base=close_base,
+                                              lang=doc["lang"]))
         parts[CLOSE_SLIDE] = close_xml.encode("utf-8")
 
     # put the modified top-level parts back into `parts`
@@ -495,6 +540,8 @@ def main():
              ("1 closing" if doc["closing"] is not None else "no closing")))
     print("  fonts: body = template (est. %d pt), plan items = %d pt (body_size=%d)"
           % (body_pt, doc["TOC"], doc["body_size"]))
+    print("  lang: %s" % ((doc["lang"] + " (stamped, dirty=0)") if doc["lang"]
+                           else "not set (template default)"))
     if problems:
         print("VALIDATION FAILED:")
         for p in problems:

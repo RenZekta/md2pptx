@@ -646,20 +646,27 @@ function firstRpr(xml, marker) {
   return m ? m[0] : null;
 }
 
-function bareRpr(bold, sz) {
+function bareRpr(bold, sz, lang) {
   // Run properties. `sz` is in hundredths of a point; when omitted the run
-  // inherits the template font size. No lang is stamped.
+  // inherits the template font size. `lang` (BCP-47, from the
+  // structure.md front matter) stamps lang + dirty="0" so PowerPoint does
+  // not fall back to its default proofing language and flag the text as
+  // misspelled.
   const attrs = [];
   if (sz) attrs.push('sz="' + sz + '"');
   if (bold) attrs.push('b="1"');
+  if (lang) { attrs.push('lang="' + lang + '"'); attrs.push('dirty="0"'); }
   return "<a:rPr" + (attrs.length ? " " + attrs.join(" ") : "") + "/>";
 }
 
-function mergeRpr(base, bold, sz) {
+function mergeRpr(base, bold, sz, lang) {
   // Build an rPr from the original run's rPr (`base`): keeps its typeface
-  // child elements and lang; stamps `bold`/`sz` (sz in hundredths of a
-  // point), overriding any stamped in `base`.
-  if (!base) return bareRpr(bold, sz);
+  // child elements; stamps `bold`/`sz` (sz in hundredths of a point),
+  // overriding any stamped in `base`. When `lang` is given, any `lang`/
+  // `dirty` attrs stamped in `base` are replaced by `lang` + dirty="0" so
+  // PowerPoint proves the run in the declared language instead of its
+  // default.
+  if (!base) return bareRpr(bold, sz, lang);
   let attrs, children = "";
   if (base.endsWith("/>")) {
     attrs = base.slice(6, -2).trim();
@@ -669,37 +676,51 @@ function mergeRpr(base, bold, sz) {
     attrs = head.slice(0, gi).trim();
     children = head.slice(gi + 1, head.length - "</a:rPr>".length);
   }
-  attrs = attrs.replace(/\bsz="\d+"/g, "").replace(/\bb="1"/g, "").trim();
+  attrs = attrs.replace(/\bsz="\d+"/g, "").replace(/\bb="1"/g, "");
   const extra = [];
   if (sz) extra.push('sz="' + sz + '"');
   if (bold) extra.push('b="1"');
-  const a = (attrs + (extra.length ? " " + extra.join(" ") : "")).trim();
+  if (lang) {
+    attrs = attrs.replace(/\blang="[^"]*"/g, "").replace(/\bdirty="[^"]*"/g, "");
+    extra.push('lang="' + lang + '"');
+    extra.push('dirty="0"');
+  }
+  const a = (attrs.trim() + (extra.length ? " " + extra.join(" ") : "")).trim();
   const prefix = "<a:rPr" + (a ? " " + a : "");
   return children ? prefix + ">" + children + "</a:rPr>" : prefix + "/>";
 }
 
-function para(level, runs, base) {
+function endParaRpr(lang) {
+  // <a:endParaRPr/> end mark of a paragraph. When `lang` is given it carries
+  // lang + dirty="0" too (PowerPoint stamps both on paste; a bare end mark
+  // would leave the paragraph's proofing language at the default).
+  if (lang) return '<a:endParaRPr lang="' + lang + '" dirty="0"/>';
+  return "<a:endParaRPr/>";
+}
+
+function para(level, runs, base, lang) {
   // Body paragraph. No size is stamped: runs inherit the template body font.
   // `base` is the original paragraph's first-run rPr: its typeface elements
-  // (a:latin/a:cs/a:ea) and lang are kept on every new run so the replaced
-  // text keeps the template's font.
+  // (a:latin/a:cs/a:ea) are kept on every new run so the replaced text keeps
+  // the template's font. `lang` (BCP-47) is stamped on every run and the end
+  // mark so PowerPoint does not flag the text as misspelled.
   const ppr = '<a:pPr lvl="' + level + '"/>';
   const rs = runs.map(function (r) {
-    return '<a:r>' + mergeRpr(base, r[1], null) + '<a:t>' + esc(r[0]) + "</a:t></a:r>";
+    return '<a:r>' + mergeRpr(base, r[1], null, lang) + '<a:t>' + esc(r[0]) + "</a:t></a:r>";
   }).join("");
-  return '<a:p>' + ppr + rs + '<a:endParaRPr/></a:p>';
+  return '<a:p>' + ppr + rs + endParaRpr(lang) + "</a:p>";
 }
 
-function titlePara(text, sz, base) {
+function titlePara(text, sz, base, lang) {
   // `sz` is in points (stamped as hundredths of a point, like the template).
-  return '<a:p><a:r>' + mergeRpr(base, false, sz ? sz * 100 : null) +
-    '<a:t>' + esc(text) + '</a:t></a:r><a:endParaRPr/></a:p>';
+  return '<a:p><a:r>' + mergeRpr(base, false, sz ? sz * 100 : null, lang) +
+    '<a:t>' + esc(text) + '</a:t></a:r>' + endParaRpr(lang) + "</a:p>";
 }
 
-function tocPara(text, sz, base) {
+function tocPara(text, sz, base, lang) {
   return '<a:p><a:pPr lvl="0"/>' +
-    '<a:r>' + mergeRpr(base, false, sz * 100) +
-    '<a:t>' + esc(text) + "</a:t></a:r><a:endParaRPr/></a:p>";
+    '<a:r>' + mergeRpr(base, false, sz * 100, lang) +
+    '<a:t>' + esc(text) + "</a:t></a:r>" + endParaRpr(lang) + "</a:p>";
 }
 
 // Replace all <a:p>...</a:p> inside the <p:sp> that contains `marker`.
@@ -769,6 +790,7 @@ function parseMd(text) {
   const n = lines.length;
   let i = 0;
   let bodySize = 18;
+  let lang = null;
   if (n && lines[0].trim() === "---") {
     i = 1;
     const fm = {};
@@ -783,9 +805,18 @@ function parseMd(text) {
     if (i < n) i++;
     const bs = parseInt(fm["body_size"], 10);
     bodySize = isNaN(bs) ? 18 : bs;
+    const langIn = (fm["lang"] || "").trim();
+    if (langIn) {
+      if (!/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/.test(langIn)) {
+        throw new Error("invalid lang '" + langIn + "' in structure.md " +
+          "front matter (expected a BCP-47 tag like ru-RU)");
+      }
+      lang = langIn;
+    }
   }
   // bodySize now only drives the plan slide: items render at bodySize - 1.
   // Body text takes its size from the template (resolveBodySize).
+  // `lang`, when declared, is stamped on every generated run and end mark.
   const TOC = bodySize - 1;
 
   const sections = [];
@@ -801,7 +832,7 @@ function parseMd(text) {
   }
   if (cur) sections.push(cur);
 
-  const doc = { bodySize: bodySize, TOC: TOC,
+  const doc = { bodySize: bodySize, TOC: TOC, lang: lang,
     title: null, plan: null, slides: [], closing: null };
   for (const sec of sections) {
     const header = sec[0], body = sec[1];
@@ -889,8 +920,8 @@ async function buildZip(templateBuffer, doc) {
   const anchor = topicAnchor(titleXml);
   const topicText = anchor === TITLE_ANCHOR_RU ? anchor + ": " + topic : topic;
   const topicBase = firstRpr(titleXml, anchor);
-  const topicPara = '<a:p><a:r>' + mergeRpr(topicBase, true, null) +
-    '<a:t>' + esc(topicText) + "</a:t></a:r><a:endParaRPr/></a:p>";
+  const topicPara = '<a:p><a:r>' + mergeRpr(topicBase, true, null, doc.lang) +
+    '<a:t>' + esc(topicText) + "</a:t></a:r>" + endParaRpr(doc.lang) + "</a:p>";
   titleXml = replacePara(titleXml, anchor, topicPara);
   zip.file(TITLE_SLIDE, titleXml);
 
@@ -898,9 +929,9 @@ async function buildZip(templateBuffer, doc) {
   if (doc.plan !== null) {
     let planXml = await getXml(PLAN_SLIDE);
     const planTitleBase = firstRpr(planXml, TITLE_MARKER);
-    planXml = setBlockParas(planXml, TITLE_MARKER, titlePara("План", null, planTitleBase));
+    planXml = setBlockParas(planXml, TITLE_MARKER, titlePara("План", null, planTitleBase, doc.lang));
     const planBodyBase = firstRpr(planXml, BODY_MARKER);
-    planXml = setBlockParas(planXml, BODY_MARKER, doc.plan.map(function (t) { return tocPara(t, doc.TOC, planBodyBase); }).join(""));
+    planXml = setBlockParas(planXml, BODY_MARKER, doc.plan.map(function (t) { return tocPara(t, doc.TOC, planBodyBase, doc.lang); }).join(""));
     zip.file(PLAN_SLIDE, planXml);
   }
 
@@ -913,9 +944,9 @@ async function buildZip(templateBuffer, doc) {
     const parsed = doc.slides[k][1];
     let x = contentXml;
     const ctBase = firstRpr(x, TITLE_MARKER);
-    x = setBlockParas(x, TITLE_MARKER, titlePara(stitle || "", null, ctBase));
+    x = setBlockParas(x, TITLE_MARKER, titlePara(stitle || "", null, ctBase, doc.lang));
     const cbBase = firstRpr(x, BODY_MARKER);
-    x = setBlockParas(x, BODY_MARKER, parsed.map(function (p) { return para(p[0], p[1], cbBase); }).join(""));
+    x = setBlockParas(x, BODY_MARKER, parsed.map(function (p) { return para(p[0], p[1], cbBase, doc.lang); }).join(""));
     zip.file(contentOrder[k], x);
   }
 
@@ -924,7 +955,7 @@ async function buildZip(templateBuffer, doc) {
     let closeXml = await getXml(CLOSE_SLIDE);
     const closeSz = placeholderSz(closeXml, TITLE_MARKER) || TITLE_PT;
     const closeBase = firstRpr(closeXml, TITLE_MARKER);
-    closeXml = setBlockParas(closeXml, TITLE_MARKER, titlePara(doc.closing, closeSz, closeBase));
+    closeXml = setBlockParas(closeXml, TITLE_MARKER, titlePara(doc.closing, closeSz, closeBase, doc.lang));
     zip.file(CLOSE_SLIDE, closeXml);
   }
 
@@ -965,6 +996,7 @@ if (typeof module !== "undefined" && module.exports) {
     RPR_RE: RPR_RE, firstRpr: firstRpr, bareRpr: bareRpr, mergeRpr: mergeRpr,
     placeholderSz: placeholderSz, resolveBodySize: resolveBodySize,
     setBlockParas: setBlockParas, replacePara: replacePara, relsName: relsName,
+    endParaRpr: endParaRpr,
     parseMd: parseMd, buildZip: buildZip, slideSpecs: slideSpecs
   };
 }
@@ -1015,7 +1047,7 @@ if (typeof module !== "undefined" && module.exports) {
   // topic in the chat message.
   const PROMPT_TEXT =
     "FORMAT RULES\n" +
-    "- Front matter (optional): body_size: <pt> — baseline for plan items, which render at body_size - 1 pt. Body text inherits the template font.\n" +
+    "- Front matter (optional): body_size: <pt> — baseline for plan items, which render at body_size - 1 pt. Body text inherits the template font. lang: <BCP-47> (e.g. ru-RU) — stamps the proofing language on all generated text so PowerPoint does not flag it as misspelled.\n" +
     "- Sections, in presentation order: exactly one \"# title\"; at most one \"# plan\"; one or more \"# slide\"; at most one \"# closing\".\n" +
     "- # title: the topic text only (one line below the # title).\n" +
     "\n" +
@@ -1122,7 +1154,9 @@ if (typeof module !== "undefined" && module.exports) {
 
       log("Built " + a.download + " (" + blob.size + " bytes) with " + count +
         " slides (body = template (est. " + bodyPt + " pt), plan items " + doc.TOC +
-        " pt (body_size " + doc.bodySize + ")). Downloaded.");
+        " pt (body_size " + doc.bodySize + "), lang " +
+        (doc.lang ? doc.lang + " (stamped, dirty=0)" : "not set") +
+        "). Downloaded.");
 
       if ($("pdfCb").checked) {
         let scenes = null;

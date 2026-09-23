@@ -16,10 +16,13 @@ checks:
      closing title stamped at the template-declared size (36 pt -> 3600).
   6. Structural validation PASSED.
 
-Writes Tests/out/ru_deck_py.pptx (the parity input for run_tests_js.js)
-and the template variants under Tests/out/.
+Writes Tests/out/ru_deck_py.pptx and Tests/out/lang_deck_py.pptx (the
+parity inputs for run_tests_js.js) and the template variants under
+Tests/out/.
 """
 import importlib.util
+import contextlib
+import io
 import os
 import re
 import sys
@@ -84,6 +87,19 @@ def region(xml, marker):
     return xml[i:xml.find("</p:sp>", i) + 7]
 
 
+def stamped_lang(xml, wanted="ru-RU"):
+    """Bad tags among rPr/endParaRPr in `xml`: missing/wrong lang or dirty."""
+    bad = []
+    for m in re.finditer(r"<a:(?:rPr|endParaRPr)\b[^>]*>", xml):
+        tag = m.group(0)
+        lang = re.search(r'\blang="([^"]+)"', tag)
+        dirty = re.search(r'\bdirty="([^"]+)"', tag)
+        if (not lang or lang.group(1) != wanted
+                or not dirty or dirty.group(1) != "0"):
+            bad.append(tag)
+    return bad
+
+
 print("[1] RU template: build + checks")
 doc, ncontent, body_pt = engine.build(struct_text, TEMPLATE, ru_out)
 probs = engine.validate(ru_out)
@@ -134,6 +150,61 @@ try:
     check("missing anchor raises SystemExit", False, "no exception raised")
 except SystemExit as e:
     check("missing anchor raises SystemExit", "topic anchor" in str(e), str(e))
+
+print("[4] lang front matter: stamped on every generated run + end mark")
+lang_text = struct_text.replace("---\nbody_size: 18\n---",
+                               "---\nbody_size: 18\nlang: ru-RU\n---")
+lang_out = os.path.join(OUT, "lang_deck_py.pptx")
+engine.build(lang_text, TEMPLATE, lang_out)
+probs = engine.validate(lang_out)
+check("lang deck validation PASSED", not probs, "; ".join(probs))
+
+z = zipfile.ZipFile(lang_out)
+bad = []
+s1 = z.read("ppt/slides/slide1.xml").decode("utf-8")
+bad += stamped_lang(region(s1, "На тему: " + TOPIC))
+s2 = z.read("ppt/slides/slide2.xml").decode("utf-8")
+bad += stamped_lang(region(s2, '<p:ph type="title"/>'))
+bad += stamped_lang(region(s2, '<p:ph idx="1"/>'))
+for i in (3, 4):
+    x = z.read("ppt/slides/slide%d.xml" % i).decode("utf-8")
+    bad += stamped_lang(region(x, '<p:ph type="title"/>'))
+    bad += stamped_lang(region(x, '<p:ph idx="1"/>'))
+check("all generated rPr/endParaRPr carry lang=ru-RU dirty=0",
+      not bad, "; ".join(bad[:4]))
+z.close()
+
+# without the key the generated body runs stay bare (template default)
+z0 = zipfile.ZipFile(ru_out)
+s3 = z0.read("ppt/slides/slide3.xml").decode("utf-8")
+body_region = region(s3, '<p:ph idx="1"/>')
+check("no lang: generated body runs stay bare (template default)",
+      'lang="' not in body_region, body_region[:160])
+z0.close()
+
+# an invalid BCP-47 tag is rejected before any build
+bad_text = struct_text.replace("body_size: 18", "body_size: 18\nlang: 123abc")
+try:
+    engine.build(bad_text, TEMPLATE, os.path.join(OUT, "bad_lang.pptx"))
+    check("invalid lang raises SystemExit", False, "no exception raised")
+except SystemExit as e:
+    check("invalid lang raises SystemExit", "invalid lang" in str(e), str(e))
+
+# the CLI report shows the lang line
+lang_struct = os.path.join(OUT, "lang_struct.md")
+with open(lang_struct, "w", encoding="utf-8") as f:
+    f.write(lang_text)
+old_argv = sys.argv
+sys.argv = ["engine.py", lang_struct, TEMPLATE, lang_out]
+buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf):
+        rc = engine.main()
+finally:
+    sys.argv = old_argv
+check("main() reports 'lang: ru-RU (stamped, dirty=0)'",
+      rc == 0 and "  lang: ru-RU (stamped, dirty=0)" in buf.getvalue(),
+      buf.getvalue().replace("\n", " | "))
 
 if fails:
     print("FAILED: %d check(s)" % len(fails))

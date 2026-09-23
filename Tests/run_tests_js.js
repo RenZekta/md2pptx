@@ -10,6 +10,9 @@
 //   - numbered body lines -> level 1, number kept in the text
 //   - plan item sizes, closing title size, no sz on body runs
 //   - byte-identical part-by-part parity vs Tests/out/ru_deck_py.pptx
+//   - lang front matter: every generated rPr/endParaRPr stamped with
+//     lang + dirty="0", invalid lang rejected, and byte-identical parity
+//     vs Tests/out/lang_deck_py.pptx (both produced by run_tests.py)
 //
 // Requires: Node, and jszip 3.x at the path below (local copy).
 
@@ -124,6 +127,74 @@ function region(xml, marker) {
   }
   check("byte-identical parts vs Python build", mism.length === 0,
     mism.join(", "));
+
+  // lang front matter: stamped on every generated run + end mark.
+  const langText = structText.replace("---\nbody_size: 18\n---",
+    "---\nbody_size: 18\nlang: ru-RU\n---");
+  const langPyOut = path.join(outDir, "lang_deck_py.pptx");
+  let langDoc = null;
+  let parseErr = null;
+  try {
+    langDoc = api.parseMd(langText);
+  } catch (e) {
+    parseErr = e;
+  }
+  check("lang front matter parsed", !!langDoc && langDoc.lang === "ru-RU",
+    parseErr ? parseErr.message : JSON.stringify(langDoc && langDoc.lang));
+
+  if (langDoc) {
+    const langJsOut = path.join(outDir, "lang_deck_js.pptx");
+    const { zip: lz } = await api.buildZip(tplBuf, langDoc);
+    fs.writeFileSync(langJsOut, await lz.generateAsync({ type: "nodebuffer" }));
+
+    const bad = [];
+    const stampedBad = (xml) => {
+      for (const m of xml.matchAll(/<a:(?:rPr|endParaRPr)\b[^>]*>/g)) {
+        const tag = m[0];
+        const lang = tag.match(/lang="([^"]+)"/);
+        const dirty = tag.match(/dirty="([^"]+)"/);
+        if (!lang || lang[1] !== "ru-RU" || !dirty || dirty[1] !== "0") {
+          bad.push(tag);
+        }
+      }
+    };
+    const s1 = await part(lz, "ppt/slides/slide1.xml");
+    stampedBad(region(s1, "На тему: " + langDoc.title));
+    const s2 = await part(lz, "ppt/slides/slide2.xml");
+    stampedBad(region(s2, '<p:ph type="title"/>'));
+    stampedBad(region(s2, '<p:ph idx="1"/>'));
+    for (let i = 3; i <= 4; i++) {
+      const x = await part(lz, "ppt/slides/slide" + i + ".xml");
+      stampedBad(region(x, '<p:ph type="title"/>'));
+      stampedBad(region(x, '<p:ph idx="1"/>'));
+    }
+    check("all generated rPr/endParaRPr carry lang=ru-RU dirty=0",
+      bad.length === 0, bad.slice(0, 4).join("; "));
+
+    if (fs.existsSync(langPyOut)) {
+      const lp = await load(langPyOut);
+      const mism2 = [];
+      for (const name of Object.keys(lz.files)) {
+        if (lz.files[name].dir) continue;
+        const a = await lz.file(name).async("nodebuffer");
+        const b = lp.file(name);
+        if (!b) { mism2.push("missing in py: " + name); continue; }
+        const bb = await b.async("nodebuffer");
+        if (!a.equals(bb)) mism2.push(name);
+      }
+      check("byte-identical parts vs Python lang build", mism2.length === 0,
+        mism2.join(", "));
+    }
+  }
+
+  let threw = false;
+  try {
+    api.parseMd(structText.replace("body_size: 18",
+      "body_size: 18\nlang: 123abc"));
+  } catch (e) {
+    threw = /invalid lang/.test(e.message);
+  }
+  check("invalid lang raises", threw);
 
   if (failures.length) {
     console.log("FAILED: " + failures.length + " check(s)");

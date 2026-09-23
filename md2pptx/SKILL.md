@@ -38,8 +38,12 @@ Exact invocation, arguments in this order:
       built <topic>.pptx
         slides: N (title + 1 plan + N content + 1 closing)
         fonts: body = template (est. 18 pt), plan items = 17 pt (body_size=18)
+        lang: ru-RU (stamped, dirty=0)
         validation: PASSED
         fit: all content slides within the box (estimate)
+
+  (the lang line reads `lang: not set (template default)` when the key is
+  absent)
 
   `validation: FAILED` lists one line per problem. If any slide overflows the
   body box, the last block becomes `fit warnings (...)` with one line per
@@ -75,6 +79,11 @@ A single source of truth. The engine reads it and produces the deck.
 - `body_size: <pt>` — baseline font size for the plan-slide items (rendered at
   `body_size - 1` pt). Body text takes no size from `structure.md` — it
   inherits the template's body font.
+- `lang: <BCP-47>` — proofing language for all generated text (e.g. `ru-RU`).
+  Without it, generated runs carry no lang and PowerPoint proves them in its
+  default language (English), flagging non-English text as "misspelled"; with
+  it, every generated run and paragraph end mark gets `lang="<tag>"`
+  `dirty="0"` (the same stamp PowerPoint puts on pasted runs).
 
 **Slide sections**, in presentation order:
 - `# title` — the title slide (freeform topic line; the topic text only —
@@ -118,9 +127,11 @@ The rules to follow when producing the `structure.md`:
   (placeholder → slide layout → master → theme default; 18 pt in the
   reference template). To change the body font, edit the template, not
   `structure.md`.
-- Replaced runs keep the typeface elements (a:latin/a:cs) and lang of the
-  original run's rPr, so an explicitly set template font (e.g. Times New
-  Roman) is preserved instead of falling back to the theme font.
+- Replaced runs keep the typeface elements (a:latin/a:cs) of the original
+  run's rPr, so an explicitly set template font (e.g. Times New Roman) is
+  preserved instead of falling back to the theme font. Their lang is the
+  declared `lang` when the front matter gives one, otherwise the original
+  run's lang (or none, when the template run is bare).
 - **Plan-slide items** — stamped at `body_size - 1` pt (the only place
   `body_size` acts).
 - **Closing-slide title** — stamped at the size declared in the template's

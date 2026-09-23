@@ -50,6 +50,11 @@ A single source of truth. The engine reads it and produces the deck.
   `body_size - 1` pt). Body text takes its size from the template's body
   placeholder (18 pt in the reference template); the engine stamps no body
   size of its own.
+- `lang: <BCP-47>` — proofing language for all generated text (e.g. `ru-RU`).
+  Without it, generated runs carry no lang and PowerPoint proves them in its
+  default language (English), flagging non-English text as "misspelled"; with
+  it, every generated run and paragraph end mark gets `lang="<tag>"`
+  `dirty="0"` (the same stamp PowerPoint puts on pasted runs).
 
 The template is **not** part of `structure.md` — it is supplied to the engine
 separately (a tool-call argument in the skill, a file input in the web app), so
@@ -90,8 +95,8 @@ md2pptx/
 │   └── index.html       # the self-contained web app (JSZip + jsPDF inlined)
 └── Tests/               # engine tests (Python + JS)
     ├── test_structure.md    # shared sample outline (exercises all features)
-    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts)
-    ├── run_tests_js.js      # JS engine tests + byte-parity vs Python
+    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts, lang)
+    ├── run_tests_js.js      # JS engine tests + byte-parity vs Python (incl. lang)
     └── out/                 # build artifacts (regenerated on each run)
 ```
 
@@ -109,9 +114,10 @@ example.
   the reference template). Only the plan-slide items are engine-stamped
   (`body_size - 1`) and the closing title takes the size declared in the
   template's closing-slide title placeholder. Replaced runs also keep the
-  typeface elements (a:latin/a:cs) and lang of the original run's rPr, so a
-  template font set explicitly (e.g. Times New Roman on the title slide) is
-  preserved.
+  typeface elements (a:latin/a:cs) of the original run's rPr, so a template
+  font set explicitly (e.g. Times New Roman on the title slide) is preserved;
+  their proofing language is the declared `lang` when the front matter gives
+  one (otherwise the original run's lang, or none).
 - **Web app PDF preview** is an approximate canvas render (browser font, layout
   math), not a true PowerPoint render — open the `.pptx` in PowerPoint for the
   final look.

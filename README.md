@@ -77,7 +77,21 @@ the `.md` stays portable across templates.
   - a `- ` list item → **level 1** (bulleted).
   - a numbered list item (`1. <text>`) → **level 1** (bulleted; the number is
     kept in the text, like the plan slide).
-- `**bold**` — a bold run within a line.
+- Inline marks (same rules inside cells):
+  - `**bold**` — a bold run within a line (`b="1"`).
+  - `*single asterisks*` — an italic run (`i="1"`); a lone `*` inside a word
+    (a footnote or a multiplication sign) stays literal.
+  - `_underscores_` — an italic run too, word-boundary only, so `a_b_c` is
+    literal.
+  - `++plus signs++` — an underlined run (`u="sng"`); `+` is never markup on
+    its own, so `1 + 2` and `C++` pass through.
+- Pipe tables: consecutive lines each starting with `|` are one table —
+  the first line is the head row (rendered bold), the second is the
+  separator (`| --- | :--: | ---: |`, which also sets column alignment), the
+  rest are body rows. Outer pipes are optional on every row; short rows are
+  padded. A table becomes a `<p:graphicFrame>` shape below the slide's text
+  (a table can never live inside a text placeholder), so its cells take an
+  explicit size: `body_size - 1` pt.
 
 **Inside a `# plan`:**
 - one numbered item per line: `1. <text>`, `2. <text>`, ...
@@ -95,8 +109,8 @@ md2pptx/
 │   └── index.html       # the self-contained web app (JSZip + jsPDF inlined)
 └── Tests/               # engine tests (Python + JS)
     ├── test_structure.md    # shared sample outline (exercises all features)
-    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts, lang)
-    ├── run_tests_js.js      # JS engine tests + byte-parity vs Python (incl. lang)
+    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts, inline marks, tables, lang)
+    ├── run_tests_js.js      # JS engine tests + byte-parity vs Python (same coverage)
     └── out/                 # build artifacts (regenerated on each run)
 ```
 
@@ -109,6 +123,18 @@ output parses as valid OOXML. `webapp/structure.md` is the generalized format
 example.
 
 ## Trade-offs / notes
+- **Inline markup and tables are engine-side, not template-side** — `**bold**`,
+  `*italic*`, `++underline++` and pipe tables are parsed identically in both
+  engines and stamped as `b="1"` / `i="1"` / `u="sng"` runs plus an
+  `<a:tbl>`-bearing `<p:graphicFrame>`; `Tests/` asserts the two builds are
+  byte-identical, so the CLI deck and the browser deck carry the same marks and
+  the same table geometry.
+- **Table geometry is engine-computed** — column widths are proportional to the
+  longest cell of each column, row heights from the wrapped-line estimate at the
+  table size, and the frame is placed below the slide's text inside the body box
+  (the `fit_check` report counts text plus table height). Borders and fills come
+  from the template's default table style (`<a:tableStyleId>`), not from the
+  engine.
 - **Body font comes from the template** — both modes stamp no font size on
   body text or slide titles (runs inherit the template's body font; 18 pt in
   the reference template). Only the plan-slide items are engine-stamped

@@ -27,8 +27,15 @@ Closing level-zero line for this section.
 Introductory line.
 
 **Examples:**
-- Example A
+- Example A, with an *italic* as-of value (as of *1 January 2026*) and an
+  ++underlined++ term marked on first use
 - Example B
+
+**Data table:**
+| Column one | Column two | Column three |
+| ---------- | :--------: | ---------: |
+| Cell       | Cell       | Cell       |
+| Cell       | Cell       | Cell       |
 
 # slide
 ## Section three

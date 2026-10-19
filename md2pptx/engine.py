@@ -13,6 +13,13 @@ Design notes
   prefixes and corrupt the deck). ElementTree is used ONLY to *parse-check*
   well-formedness at validation time.
 * Text is XML-escaped (&, <, >).
+* Inline marks: `**bold**`, `*italic*`/`_italic_`, `++underline++` become the
+  run properties b="1" / i="1" / u="sng" (parse_inline documents the boundary
+  rules; an unbalanced marker stays plain text).
+* A body line starting with "|" is a pipe table: it becomes a real
+  <p:graphicFrame><a:tbl> shape appended to the slide's <p:spTree> (a table
+  cannot live in a text placeholder), placed below the slide's text lines
+  under the same average-character height estimate fit_check uses.
 * The template must contain: a title slide (slide1, freeform, topic line
   anchored by the string TITLE_ANCHOR), a plan slide (slide2), a content slide
   (slide3, the clone prototype, with <p:ph type="title"/> and <p:ph idx="1"/>),
@@ -52,6 +59,16 @@ BODY_W = 8229600.0                   # body box width  (EMU)
 BODY_H = 4525963.0                   # body box height (EMU)
 BODY_W_IN = BODY_W / EMU_PER_INCH    # 9.0 in
 BODY_H_IN = BODY_H / EMU_PER_INCH     # 4.95 in
+BODY_OFF_X = 457200                  # body box offset (EMU, reference template)
+BODY_OFF_Y = 1600200
+
+# Tables: a <p:graphicFrame> carrying an <a:tbl> (the OOXML form PowerPoint
+# itself writes; see python-pptx's graphicFrame output).
+TABLE_URI = "http://schemas.openxmlformats.org/drawingml/2006/table"
+TABLE_STYLE_DEFAULT = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"  # Office default
+TABLE_GAP = 137160                   # gap above a table (0.15 in, EMU)
+TABLE_CELL_PAD = 91440               # cell top+bottom inset (2 * 0.05 in)
+TABLE_MIN_COL_CHARS = 6              # column width floor, in characters
 
 CONTENT_SLIDE = "ppt/slides/slide3.xml"          # clone prototype
 CONTENT_RELS = "ppt/slides/_rels/slide3.xml.rels"
@@ -89,32 +106,92 @@ def esc(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def parse_bold(text):
-    """Split text into (text, bold) runs on **...**."""
+def parse_inline(text):
+    """Split text into (text, bold, italic, underline) runs on the inline
+    marks: `**bold**`, `*italic*` and `_italic_`, `++underline++`.
+
+    A marker toggles its style only at a real boundary: when opening, the
+    character after it must not be a space (or the end of the line); when
+    closing, the character before it must not be a space. On either side the
+    neighbouring character must not repeat the marker, so a stray `a ** b`
+    stays literal and `__x__` is not a mark (bold is `**`). `_` is stricter
+    still: it marks only at word boundaries (`isalnum` on either side
+    disqualifies it), so `snake_case` and file names stay plain text. `**` is
+    considered before `*`, which keeps `**bold**` bold and leaves the outer
+    stars of `***x***` literal, as before. Marks must balance within a line;
+    an unbalanced opening mark simply styles to the end of the line."""
+    n = len(text)
+
+    def alnum(p):
+        return 0 <= p < n and (text[p].isalnum() or text[p] == "_")
+
+    def blank(p):
+        return 0 <= p < n and (text[p] == " " or text[p] == "\t")
+
+    state = [False, False, False]        # bold, italic, underline
     runs = []
-    for part in re.split(r"(\*\*[^*]+\*\*)", text):
-        if not part:
-            continue
-        if part.startswith("**") and part.endswith("**"):
-            runs.append((part[2:-2], True))
+    buf = []
+
+    def toggles(i, ln, ch, idx, word_strict):
+        """May the marker at `i` open or close its style?"""
+        nxt, prv = i + ln, i - 1
+        if state[idx]:                                   # closing
+            if prv < 0 or blank(prv) or text[prv] == ch:
+                return False
+            if word_strict and alnum(nxt):
+                return False
+            return True
+        if nxt >= n or blank(nxt) or text[nxt] == ch:     # opening
+            return False
+        if word_strict and alnum(prv):
+            return False
+        return True
+
+    i = 0
+    while i < n:
+        ch = text[i]
+        two = text[i:i + 2]
+        hit = None
+        if two == "**" and toggles(i, 2, "*", 0, False):
+            hit = (2, 0)
+        elif two == "++" and toggles(i, 2, "+", 2, False):
+            hit = (2, 2)
+        elif ch == "*" and toggles(i, 1, "*", 1, False):
+            hit = (1, 1)
+        elif ch == "_" and toggles(i, 1, "_", 1, True):
+            hit = (1, 1)
+        if hit:
+            if buf:
+                runs.append(("".join(buf), state[0], state[1], state[2]))
+                buf = []
+            state[hit[1]] = not state[hit[1]]
+            i += hit[0]
         else:
-            runs.append((part, False))
+            buf.append(ch)
+            i += 1
+    if buf:
+        runs.append(("".join(buf), state[0], state[1], state[2]))
     if not runs:
-        runs = [("", False)]
+        runs = [("", False, False, False)]
     return runs
 
 
-def _rpr(bold, sz=None, lang=None):
-    """Run properties. `sz` is in hundredths of a point; when omitted the
-    run inherits the template font size. `lang` (BCP-47, from the
-    structure.md front matter) stamps lang + dirty="0" so PowerPoint does
-    not fall back to its default proofing language and flag the text as
-    misspelled."""
+def _rpr(fmt, sz=None, lang=None):
+    """Run properties. `fmt` is the (bold, italic, underline) triple; `sz` is
+    in hundredths of a point (omitted: inherit the template size); `lang`
+    (BCP-47, from the structure.md front matter) stamps lang + dirty="0" so
+    PowerPoint does not fall back to its default proofing language and flag the
+    text as misspelled. Italic is `i="1"`, underline `u="sng"`."""
+    bold, italic, underline = fmt
     attrs = []
     if sz:
         attrs.append('sz="%d"' % sz)
     if bold:
         attrs.append('b="1"')
+    if italic:
+        attrs.append('i="1"')
+    if underline:
+        attrs.append('u="sng"')
     if lang:
         attrs.append('lang="%s"' % lang)
         attrs.append('dirty="0"')
@@ -137,15 +214,18 @@ def first_rpr(xml, marker):
     return m.group(0) if m else None
 
 
-def merge_rpr(base, bold=None, sz=None, lang=None):
+def merge_rpr(base, fmt=None, sz=None, lang=None):
     """Build an rPr from the original run's rPr (`base`): keeps its typeface
-    child elements; stamps `bold`/`sz` (sz in hundredths of a point),
-    overriding any stamped in `base`. When `lang` is given, any `lang`/
+    child elements; stamps `fmt` (the bold/italic/underline triple, None = no
+    marks) and `sz` (hundredths of a point), overriding any stamped in `base`
+    — including a template run that was already italic or underlined, which
+    must not leak into the new text. When `lang` is given, any `lang`/
     `dirty` attrs stamped in `base` are replaced by `lang` + dirty="0" so
     PowerPoint proves the run in the declared language instead of its
     default."""
+    bold, italic, underline = fmt if fmt else (False, False, False)
     if not base:
-        return _rpr(bold, sz, lang)
+        return _rpr(fmt, sz, lang)
     if base.endswith("/>"):
         attrs = base[6:-2].strip()
         children = ""
@@ -156,11 +236,17 @@ def merge_rpr(base, bold=None, sz=None, lang=None):
         children = head[gi + 1:-len("</a:rPr>")]
     attrs = re.sub(r'\bsz="\d+"', "", attrs)
     attrs = re.sub(r'\bb="1"', "", attrs)
+    attrs = re.sub(r'\bi="1"', "", attrs)
+    attrs = re.sub(r'\bu="[^"]*"', "", attrs)
     extra = []
     if sz:
         extra.append('sz="%d"' % sz)
     if bold:
         extra.append('b="1"')
+    if italic:
+        extra.append('i="1"')
+    if underline:
+        extra.append('u="sng"')
     if lang:
         attrs = re.sub(r'\blang="[^"]*"', "", attrs)
         attrs = re.sub(r'\bdirty="[^"]*"', "", attrs)
@@ -184,30 +270,159 @@ def endpara_rpr(lang=None):
 
 
 def para(level, runs, sz=None, base=None, lang=None):
-    """Body paragraph at `level` (0 = plain line, 1 = bullet). The font size
+    """Body paragraph at `level` (0 = plain line, 1 = bullet). `runs` are the
+    (text, bold, italic, underline) triples of parse_inline. The font size
     is stamped only when `sz` is given; otherwise runs inherit the
     template's body font. `base` is the original paragraph's first-run rPr:
     its typeface elements (a:latin/a:cs/a:ea) are kept on every new run so
     the replaced text keeps the template's font. `lang` (BCP-47) is stamped
-    on every run and the end mark so PowerPoint does not flag the text."""
+    on every run and the paragraph end mark so PowerPoint does not flag the
+    text."""
     ppr = '<a:pPr lvl="%d"/>' % level
     rs = "".join('<a:r>%s<a:t>%s</a:t></a:r>'
-                 % (merge_rpr(base, b, sz, lang), esc(t)) for (t, b) in runs)
+                 % (merge_rpr(base, r[1:], sz, lang), esc(r[0])) for r in runs)
     return '<a:p>%s%s%s</a:p>' % (ppr, rs, endpara_rpr(lang))
 
 
 def title_para(text, sz=None, base=None, lang=None):
-    """`sz` is in points (stamped as hundredths, like the template does)."""
+    """`sz` is in points (stamped as hundredths, like the template does).
+    A title carries no inline marks of its own; slide titles take the
+    template's title style."""
     return ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
-            % (merge_rpr(base, False, sz * 100 if sz else None, lang),
+            % (merge_rpr(base, None, sz * 100 if sz else None, lang),
                esc(text), endpara_rpr(lang)))
 
 
 def toc_para(text, sz, base=None, lang=None):
     return ('<a:p><a:pPr lvl="0"/>'
             '<a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
-            % (merge_rpr(base, False, sz * 100, lang), esc(text),
+            % (merge_rpr(base, None, sz * 100, lang), esc(text),
                endpara_rpr(lang)))
+
+
+def chars_per_line(width_in, pt):
+    """Characters that fit on one line of `width_in` inches at `pt` — the
+    average-char-width heuristic fit_check and the table layout share."""
+    return max(1, int(width_in / (AVG_CHAR_EM * (pt / 72.0))))
+
+
+def est_lines(text, width_in, pt):
+    return max(1, math.ceil(len(text) / chars_per_line(width_in, pt)))
+
+
+def line_emu(pt):
+    """One line's height in EMU at `pt` (integer: the heuristic is exact for
+    whole point sizes, so Python and JS agree byte-for-byte)."""
+    return int(LINE_SPACING * (pt / 72.0) * EMU_PER_INCH + 0.5)
+
+
+def runs_text(runs):
+    return "".join(r[0] for r in runs)
+
+
+def parse_table(lines):
+    """Parse pipe-table lines into {"header": bool, "align": [...],
+    "cells": [[run-tuples]]}.
+
+    A line is a row when it starts with "|"; cells are split on "|" and
+    trimmed, and the outer pipes are optional. A row of only |, -, : and
+    spaces is the header separator: it is dropped, marks the row above as the
+    header (rendered bold) and sets each column's alignment from its colons
+    (`:--` left, `--:` right, `:-:` centre). Short rows are padded to the
+    widest one; cells carry the same inline marks as body lines."""
+    rows, aligns, header = [], [], False
+    for ln in lines:
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if (rows and any(cells)
+                and all(re.match(r"^:?-+:?$", c) for c in cells if c)):
+            header = True
+            al = []
+            for c in cells:
+                if c.startswith(":") and c.endswith(":"):
+                    al.append("ctr")
+                elif c.endswith(":"):
+                    al.append("r")
+                elif c.startswith(":"):
+                    al.append("l")
+                else:
+                    al.append(None)
+            aligns = al
+            continue
+        rows.append(cells)
+    width = max(len(r) for r in rows)
+    for r in rows:
+        del r[width:]                       # ragged wide rows: extra cells drop
+        while len(r) < width:
+            r.append("")
+    cells = []
+    for ri, row in enumerate(rows):
+        rr = []
+        for cell in row:
+            runs = parse_inline(cell)
+            if header and ri == 0:
+                runs = [(t, True, it, ul) for (t, _b, it, ul) in runs]
+            rr.append(runs)
+        cells.append(rr)
+    return {"header": header, "align": aligns + [None] * (width - len(aligns)),
+            "cells": cells}
+
+
+def table_geom(tbl, y, table_pt):
+    """Geometry (EMU) of one table in the body box: full body width,
+    column widths proportional to the longest cell of each column (floored at
+    TABLE_MIN_COL_CHARS characters, leftover EMU to the leftmost columns),
+    row heights from the wrapped-line estimate at the table text size plus the
+    cell insets. `y` is where the table starts in the body box."""
+    ncol = len(tbl["align"])
+    weights = []
+    for ci in range(ncol):
+        w = TABLE_MIN_COL_CHARS
+        for row in tbl["cells"]:
+            w = max(w, len(runs_text(row[ci])))
+        weights.append(w)
+    total = int(BODY_W)
+    s = sum(weights)
+    col_w = [total * w // s for w in weights]
+    for ci in range(total - sum(col_w)):
+        col_w[ci] += 1
+    row_h = []
+    for row in tbl["cells"]:
+        lines = 1
+        for ci, cell in enumerate(row):
+            lines = max(lines, est_lines(runs_text(cell),
+                                         col_w[ci] / EMU_PER_INCH, table_pt))
+        row_h.append(lines * line_emu(table_pt) + TABLE_CELL_PAD)
+    return {"x": BODY_OFF_X, "y": y, "cx": sum(col_w), "cy": sum(row_h),
+            "col_w": col_w, "row_h": row_h}
+
+
+def slide_layout(parsed, body_pt, table_pt):
+    """Vertical flow of one content slide, from the body-box top.
+
+    A text placeholder flows all of its own paragraphs from the top of the
+    body box, so a table — a separate <p:graphicFrame> shape — always sits
+    below them: the text height is estimated first (the same
+    average-character heuristic as fit_check), then the tables stack in
+    document order, each TABLE_GAP under the previous block. Returns
+    {"h_emu": total height, "tables": [(tbl, geom)]}, the estimate fit_check
+    compares with the body box."""
+    text_emu = 0
+    for item in parsed:
+        if item[0] != "table":
+            text_emu += (est_lines(runs_text(item[1]), BODY_W_IN, body_pt)
+                         * line_emu(body_pt))
+    y = int(BODY_OFF_Y) + text_emu
+    h = text_emu
+    tables = []
+    for item in parsed:
+        if item[0] == "table":
+            y += TABLE_GAP
+            h += TABLE_GAP
+            geom = table_geom(item[1], y, table_pt)
+            tables.append((item[1], geom))
+            y += geom["cy"]
+            h += geom["cy"]
+    return {"h_emu": h, "tables": tables}
 
 
 def set_block_paras(xml, marker, new_paras):
@@ -243,6 +458,73 @@ def placeholder_sz(xml, marker):
     return int(m.group(1)) // 100 if m else None
 
 
+def cell_para(runs, algn, sz, base=None, lang=None):
+    """One paragraph of a table cell. `runs` are (text, bold, italic,
+    underline) triples; `sz` is in points and always stamped — a cell has no
+    placeholder to inherit a size from. `algn` is stamped only for "ctr"/"r"
+    (left is the OOXML default). An empty cell is the bare <a:p/>."""
+    if not any(r[0] for r in runs):
+        return "<a:p/>"
+    ppr = '<a:pPr algn="%s"/>' % algn if algn else ""
+    rs = "".join('<a:r>%s<a:t>%s</a:t></a:r>'
+                 % (merge_rpr(base, r[1:], sz * 100 if sz else None, lang),
+                    esc(r[0])) for r in runs if r[0])
+    return '<a:p>%s%s%s</a:p>' % (ppr, rs, endpara_rpr(lang))
+
+
+def cell_xml(cell, algn, sz, base, lang):
+    """One <a:tc> cell: text body first, then the (empty) cell properties —
+    the order the TableCellBase type requires."""
+    return ('<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>%s</a:txBody>'
+            '<a:tcPr/></a:tc>' % cell_para(cell, algn, sz, base, lang))
+
+
+def table_frame_xml(tbl, geom, style_id, sz, base, lang, shape_id, name_no):
+    """One <p:graphicFrame> carrying an <a:tbl> — the OOXML form PowerPoint
+    writes for a slide table (a table can never live inside a text
+    placeholder, so it is a separate shape in <p:spTree>)."""
+    rows = tbl["cells"]
+    aligns = tbl["align"]
+    grid = "".join('<a:gridCol w="%d"/>' % w for w in geom["col_w"])
+    trs = []
+    for ri, row in enumerate(rows):
+        cells = "".join(cell_xml(cell, aligns[ci] if ci < len(aligns) else None,
+                                 sz, base, lang)
+                        for ci, cell in enumerate(row))
+        trs.append('<a:tr h="%d">%s</a:tr>' % (geom["row_h"][ri], cells))
+    return ('<p:graphicFrame><p:nvGraphicFramePr>'
+            '<p:cNvPr id="%d" name="Table %d"/>'
+            '<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/>'
+            '</p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr>'
+            '<p:xfrm><a:off x="%d" y="%d"/><a:ext cx="%d" cy="%d"/></p:xfrm>'
+            '<a:graphic><a:graphicData uri="%s"><a:tbl>'
+            '<a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>%s'
+            '</a:tableStyleId></a:tblPr><a:tblGrid>%s</a:tblGrid>%s'
+            '</a:tbl></a:graphicData></a:graphic></p:graphicFrame>'
+            % (shape_id, name_no, geom["x"], geom["y"], geom["cx"], geom["cy"],
+               TABLE_URI, style_id, grid, "".join(trs)))
+
+
+def next_shape_id(xml):
+    """One past the largest <p:cNvPr id=".."> in a slide — shape ids must be
+    unique per slide."""
+    ids = [int(m) for m in re.findall(r'<p:cNvPr\b[^>]*\bid="(\d+)"', xml)]
+    return (max(ids) if ids else 1) + 1
+
+
+def insert_graphic_frames(xml, frames):
+    """Append graphic frames at the end of the slide's <p:spTree>."""
+    i = xml.rindex("</p:spTree>")
+    return xml[:i] + "".join(frames) + xml[i:]
+
+
+def table_style_id(table_styles_xml):
+    """The default table style the template declares
+    (<a:tblStyleLst def="{GUID}">), else the Office default GUID."""
+    m = re.search(r'<a:tblStyleLst\b[^>]*\bdef="([^"]+)"', table_styles_xml)
+    return m.group(1) if m else TABLE_STYLE_DEFAULT
+
+
 def rels_name(slide_name):
     base = slide_name.split("/")[-1]            # "slide5.xml"
     return "ppt/slides/_rels/" + base[:-4] + ".xml.rels"
@@ -276,9 +558,11 @@ def parse_md(text):
                     "ERROR: invalid lang %r in structure.md front matter "
                     "(expected a BCP-47 tag like ru-RU)" % lang_in)
             lang = lang_in
-    # body_size now only drives the plan slide: items render at body_size - 1.
-    # Body text takes its size from the template (see resolve_body_size).
-    # `lang`, when declared, is stamped on every generated run and end mark.
+    # body_size now only drives the plan slide (items at body_size - 1) and the
+    # table cells (also body_size - 1: a table has no placeholder to inherit a
+    # size from). Body text takes its size from the template (resolve_body_size)
+    # and stamps no size of its own. `lang`, when declared, is stamped on every
+    # generated run and end mark.
     TOC = body_size - 1
 
     sections = []
@@ -293,7 +577,7 @@ def parse_md(text):
     if cur is not None:
         sections.append(cur)
 
-    doc = {"body_size": body_size, "TOC": TOC, "lang": lang,
+    doc = {"body_size": body_size, "TOC": TOC, "table_pt": TOC, "lang": lang,
            "title": None, "plan": None, "slides": [], "closing": None}
     for header, body in sections:
         if header == "title":
@@ -305,21 +589,34 @@ def parse_md(text):
         elif header == "slide":
             stitle = None
             parsed = []
-            for b in body:
+            j = 0
+            while j < len(body):
+                b = body[j]
                 if b.startswith("## "):
                     stitle = b[3:].strip()
+                    j += 1
+                    continue
+                s = b.strip()
+                if not s:
+                    j += 1
+                    continue
+                if s.startswith("|"):
+                    rows = []
+                    while (j < len(body) and body[j].strip()
+                           and body[j].strip().startswith("|")):
+                        rows.append(body[j])
+                        j += 1
+                    parsed.append(("table", parse_table(rows)))
+                    continue
+                if s.startswith("- "):
+                    parsed.append((1, parse_inline(s[2:])))
+                elif re.match(r"^\d+\.\s", s):
+                    # numbered list item: rendered as a level-1 bullet, keeping
+                    # the number in the text (like the plan slide)
+                    parsed.append((1, parse_inline(s)))
                 else:
-                    s = b.strip()
-                    if not s:
-                        continue
-                    if s.startswith("- "):
-                        parsed.append((1, parse_bold(s[2:])))
-                    elif re.match(r"^\d+\.\s", s):
-                        # numbered list item: rendered as a level-1 bullet,
-                        # keeping the number in the text (like the plan slide)
-                        parsed.append((1, parse_bold(s)))
-                    else:
-                        parsed.append((0, parse_bold(s)))
+                    parsed.append((0, parse_inline(s)))
+                j += 1
             doc["slides"].append((stitle, parsed))
     return doc
 
@@ -414,7 +711,7 @@ def build(structure_text, template_path, out_path):
     topic_text = (anchor + ": " + topic) if anchor == TITLE_ANCHOR_RU else topic
     topic_base = first_rpr(title_xml, anchor)
     topic_para = ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
-                  % (merge_rpr(topic_base, True, None, doc["lang"]),
+                  % (merge_rpr(topic_base, (True, False, False), None, doc["lang"]),
                      esc(topic_text), endpara_rpr(doc["lang"])))
     title_xml = replace_para(title_xml, anchor, topic_para)
     parts[TITLE_SLIDE] = title_xml.encode("utf-8")
@@ -435,8 +732,12 @@ def build(structure_text, template_path, out_path):
 
     # 6) fill the content slides (slide3 + clones, in order); body runs
     #    inherit the template body font (no sz stamped); the original
-    #    runs' typeface/lang are kept via first_rpr
+    #    runs' typeface/lang are kept via first_rpr; table blocks become
+    #    <p:graphicFrame> shapes below the slide's text, cells stamped at
+    #    body_size - 1 (a table has no placeholder to inherit a size from)
     content_order = [CONTENT_SLIDE] + [fn for fn, _sid, _rid in clones]
+    style_id = table_style_id(
+        parts.get("ppt/tableStyles.xml", b"").decode("utf-8", "ignore"))
     for (stitle, parsed), fn in zip(doc["slides"], content_order):
         x = parts[fn].decode("utf-8")
         ct_base = first_rpr(x, TITLE_MARKER)
@@ -444,9 +745,16 @@ def build(structure_text, template_path, out_path):
                            title_para(stitle or "", base=ct_base,
                                      lang=doc["lang"]))
         cb_base = first_rpr(x, BODY_MARKER)
+        lay = slide_layout(parsed, body_pt, doc["table_pt"])
         x = set_block_paras(x, BODY_MARKER,
                            "".join(para(lv, runs, base=cb_base, lang=doc["lang"])
-                                  for lv, runs in parsed))
+                                  for (lv, runs) in parsed if lv != "table"))
+        if lay["tables"]:
+            nid = next_shape_id(x)
+            x = insert_graphic_frames(
+                x, [table_frame_xml(tbl, geom, style_id, doc["table_pt"], cb_base,
+                                    doc["lang"], nid + k, k + 1)
+                    for k, (tbl, geom) in enumerate(lay["tables"])])
         parts[fn] = x.encode("utf-8")
 
     # 7) fill the closing slide (title stamped at the template's declared size)
@@ -481,18 +789,13 @@ def build(structure_text, template_path, out_path):
 # ----------------------------- checks ---------------------------------------
 def fit_check(doc, body_pt):
     """Heuristic per-content-slide height estimate at the template body size
-    (`body_pt`); returns (slide, est_in, box_in) warnings."""
+    (`body_pt`): the text lines plus any table geometry slide_layout places in
+    the body box; returns (slide, est_in, box_in) warnings."""
     out = []
     for stitle, parsed in doc["slides"]:
-        h = 0.0
-        for _lv, runs in parsed:
-            text = "".join(t for (t, _b) in runs)
-            char_w_in = AVG_CHAR_EM * (body_pt / 72.0)
-            cpl = max(1, int(BODY_W_IN / char_w_in))
-            nlines = max(1, math.ceil(len(text) / cpl))
-            h += nlines * (LINE_SPACING * body_pt / 72.0)
-        if h > BODY_H_IN:
-            out.append((stitle, round(h, 2), round(BODY_H_IN, 2)))
+        h_in = slide_layout(parsed, body_pt, doc["table_pt"])["h_emu"] / EMU_PER_INCH
+        if h_in > BODY_H_IN:
+            out.append((stitle, round(h_in, 2), round(BODY_H_IN, 2)))
     return out
 
 
@@ -540,6 +843,9 @@ def main():
              ("1 closing" if doc["closing"] is not None else "no closing")))
     print("  fonts: body = template (est. %d pt), plan items = %d pt (body_size=%d)"
           % (body_pt, doc["TOC"], doc["body_size"]))
+    n_tables = sum(1 for _st, parsed in doc["slides"]
+                   for it in parsed if it[0] == "table")
+    print("  tables: %d (cells at %d pt)" % (n_tables, doc["table_pt"]))
     print("  lang: %s" % ((doc["lang"] + " (stamped, dirty=0)") if doc["lang"]
                            else "not set (template default)"))
     if problems:
@@ -549,7 +855,7 @@ def main():
         return 1
     print("  validation: PASSED")
     if over:
-        print("  fit warnings (est. body height > %0.2fin box at %d pt):"
+        print("  fit warnings (est. text + table height > %0.2fin box at %d pt):"
               % (BODY_H_IN, body_pt))
         for stitle, h, box in over:
             print("    - %r: est %0.2fin" % (stitle, h))

@@ -9,12 +9,19 @@
 //   - slide1 topic = "На тему: <topic>" (format preserved), bold, font kept
 //   - numbered body lines -> level 1, number kept in the text
 //   - plan item sizes, closing title size, no sz on body runs
+//   - inline marks: *italic* -> i="1", ++underline++ -> u="sng", **bold** ->
+//     b="1", and no marker characters left in the text
+//   - pipe table -> p:graphicFrame with a:tbl, one tr per row, one td per cell,
+//     head row bold, cells stamped at body_size - 1, separator alignment, frame
+//     placed after the body placeholder inside the shape tree
 //   - byte-identical part-by-part parity vs Tests/out/ru_deck_py.pptx
 //   - lang front matter: every generated rPr/endParaRPr stamped with
 //     lang + dirty="0", invalid lang rejected, and byte-identical parity
 //     vs Tests/out/lang_deck_py.pptx (both produced by run_tests.py)
 //
-// Requires: Node, and jszip 3.x at the path below (local copy).
+// Requires: Node, and jszip 3.x. JSZIP_PATH points at the local Windows copy;
+// on other machines the plain `require("jszip")` fallback is used (install
+// jszip in a node_modules next to this test, e.g. at the repo root).
 
 const fs = require("fs");
 const path = require("path");
@@ -23,7 +30,12 @@ const HERE = __dirname;
 const REPO = path.resolve(HERE, "..");
 const JSZIP_PATH =
   "C:/Users/Ren/AppData/Roaming/npm/node_modules/openclaw/node_modules/jszip";
-const JSZip = require(JSZIP_PATH);
+let JSZip;
+try {
+  JSZip = require(JSZIP_PATH);
+} catch (e) {
+  JSZip = require("jszip");
+}
 
 const html = fs.readFileSync(path.join(REPO, "webapp", "index.html"), "utf8");
 // Engine core = the section between the shared-core header and the Mode B
@@ -113,6 +125,36 @@ function region(xml, marker) {
   const s4 = await part(z, "ppt/slides/slide4.xml");
   check("closing title stamped at template size (3600)",
     region(s4, '<p:ph type="title"/>').includes('sz="3600"'));
+
+  const t3 = texts(s3);
+  const flat3 = t3.join(" ");
+  const ir = runOf(s3, "italic");
+  check("italic run stamped i=\"1\"", ir.includes('i="1"'), ir);
+  const ur = runOf(s3, "underlined");
+  check("underlined run stamped u=\"sng\"", ur.includes('u="sng"'), ur);
+  check("bold still stamped alongside", runOf(s3, "Италии").includes('b="1"'));
+  check("no stray markers in the text", !flat3.includes("*") && !flat3.includes("++"),
+    JSON.stringify(flat3));
+  const s5 = await part(z, "ppt/slides/slide5.xml");
+  const t5 = texts(s5);
+  check("table cells present",
+    ["Cell A", "Cell B", "Cell C", "6"].every(function (x) { return t5.includes(x); }),
+    JSON.stringify(t5));
+  check("table is a p:graphicFrame", s5.includes("<p:graphicFrame>"), s5.slice(0, 200));
+  check("a:tbl with one row per line",
+    (s5.match(/<a:tr /g) || []).length === 3, s5);
+  check("one a:tc per cell (3 rows x 3 cols)",
+    (s5.match(/<a:tc>/g) || []).length === 9, s5);
+  check("head row cells inherit the table's bold",
+    runOf(s5, "Cell A").includes('b="1"'), runOf(s5, "Cell A"));
+  check("table cells stamped at body_size - 1",
+    (s5.match(/sz="1700"/g) || []).length === 9, s5);
+  check("separator alignment applied",
+    s5.includes('algn="ctr"') && s5.includes('algn="r"'), s5);
+  check("frame comes after the body placeholder",
+    s5.indexOf("<p:graphicFrame>") > s5.indexOf('<p:ph idx="1"/>'), s5.slice(0, 200));
+  check("frame inside the shape tree",
+    s5.indexOf("<p:graphicFrame>") < s5.lastIndexOf("</p:spTree>"), s5.slice(-200));
 
   // Byte-identical part-by-part parity with the Python build.
   const py = await load(pyOut);

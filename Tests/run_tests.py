@@ -135,6 +135,34 @@ s4 = z.read("ppt/slides/slide4.xml").decode("utf-8")
 check("closing title stamped at template size (3600)",
       'sz="3600"' in region(s4, '<p:ph type="title"/>'))
 
+print("[4b] inline marks (*italic*, ++underline++) and pipe tables")
+flat = " ".join(t3)
+check("italic run stamped i=\"1\"", 'i="1"' in run_of(s3, "italic"),
+      run_of(s3, "italic"))
+check("underlined run stamped u=\"sng\"", 'u="sng"' in run_of(s3, "underlined"),
+      run_of(s3, "underlined"))
+check("bold still stamped alongside", 'b="1"' in run_of(s3, "Италии"),
+      run_of(s3, "Италии"))
+check("no stray markers in the text",
+      "*" not in flat and "++" not in flat, repr(flat))
+s5 = z.read("ppt/slides/slide5.xml").decode("utf-8")
+t5 = texts(s5)
+check("table cells present", all(x in t5 for x in ("Cell A", "Cell B", "Cell C", "6")),
+      repr(t5))
+check("table is a p:graphicFrame", "<p:graphicFrame>" in s5, s5[:200])
+check("a:tbl with one row per line", s5.count("<a:tr ") == 3, s5)
+check("one a:tc per cell (3 rows x 3 cols)", s5.count("<a:tc>") == 9, s5)
+check("head row cells inherit the table's bold",
+      'b="1"' in run_of(s5, "Cell A"), run_of(s5, "Cell A"))
+check("table cells stamped at body_size - 1",
+      s5.count('sz="1700"') == 9, s5)
+check("separator alignment applied",
+      'algn="ctr"' in s5 and 'algn="r"' in s5, s5)
+check("frame comes after the body placeholder",
+      s5.index("<p:graphicFrame>") > s5.index('<p:ph idx="1"/>'), s5[:200])
+check("frame inside the shape tree",
+      s5.index("<p:graphicFrame>") < s5.rindex("</p:spTree>"), s5[-200:])
+
 print("[2] EN 'Topic' template: whole line replaced")
 variant_template(TEMPLATE, en_tpl, "На тему", "Topic")
 engine.build(struct_text, en_tpl, en_out)

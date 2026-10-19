@@ -102,7 +102,19 @@ A single source of truth. The engine reads it and produces the deck.
   - a `- ` list item → **level 1** (bulleted).
   - a numbered list item (`1. <text>`) → **level 1** (bulleted; the number is
     kept in the text, like the plan slide).
-- `**bold**` — a bold run within a line.
+- Inline marks (also inside table cells):
+  - `**bold**` — a bold run (`b="1"`).
+  - `*single asterisks*` and `_underscores_` — an italic run (`i="1"`); each
+    marker must sit at a word boundary, so a lone `*` inside a word (a footnote
+    or a multiplication sign) and `a_b_c` stay literal.
+  - `++plus signs++` — an underlined run (`u="sng"`); a single `+` is never
+    markup, so `1 + 2` and `C++` pass through.
+- Pipe tables: consecutive lines each starting with `|` form one table — the
+  first line is the head row (rendered bold), the second the separator
+  (`| --- | :--: | ---: |`, which also sets column alignment), the rest body
+  rows. Outer pipes optional; short rows padded. A table becomes a
+  `<p:graphicFrame>` shape placed *below* the slide's text (a table cannot live
+  in a text placeholder), so its cells are stamped at `body_size - 1` pt.
 
 **Inside a `# plan`:**
 - one numbered item per line: `1. <text>`, `2. <text>`, ...
@@ -113,6 +125,13 @@ The rules to follow when producing the `structure.md`:
 - **Levels** — plain line = level 0 (label / intro); `- ` = level 1 (bullet).
 - **Plan** — a numbered list (`1.`, `2.`, ...), not bullets.
 - **Bold** — mark key labels with `**bold**`.
+- **Italic** — `*italic*` for as-of values, dates, foreign or quoted terms;
+  not for whole paragraphs.
+- **Underline** — `++underlined++` only where the source itself underlines
+  (a term defined on first use); never for decoration.
+- **Tables** — a pipe table for structured data (figures, statutory points,
+  comparisons); keep it to roughly ≤ 5 rows so it fits under the slide's text,
+  and put it after the lines it belongs to.
 - **Citations** — cite a statute/article by number *and* by point where it
   enumerates points (e.g. `ч. 1 ст. 56 УК РФ`, `п. 2 ст. 401 ГК РФ`, U.S. Const. art. I, para. 8); do not cite a bare
   article when a specific part is meant.
@@ -132,8 +151,10 @@ The rules to follow when producing the `structure.md`:
   preserved instead of falling back to the theme font. Their lang is the
   declared `lang` when the front matter gives one, otherwise the original
   run's lang (or none, when the template run is bare).
-- **Plan-slide items** — stamped at `body_size - 1` pt (the only place
-  `body_size` acts).
+- **Plan-slide items** — stamped at `body_size - 1` pt.
+- **Table cells** — stamped at `body_size - 1` pt too (the report shows
+  `tables: N (cells at X pt)`); a cell has no placeholder to inherit a size
+  from, so the size is always explicit.
 - **Closing-slide title** — stamped at the size declared in the template's
   closing-slide title placeholder (36 pt in the reference template).
 - The fit report estimates body height at the template's effective body size

@@ -588,14 +588,19 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 // before requiring this file; the module.exports guard exposes the functions.
 
 const EMU_PER_INCH = 914400;
-const SLIDE_W = 9144000;       // EMU (4:3, 10in x 7.5in)
-const SLIDE_H = 6858000;       // EMU
+let SLIDE_W = 9144000;         // EMU: the template's slide size (setSlideSize);
+let SLIDE_H = 6858000;         // 4:3, 10in x 7.5in until a template is read
+
+// Take the slide size from a presentation.xml <p:sldSz>.
+function setSlideSize(presXml) {
+  const m = /<p:sldSz\b[^>]*\bcx="([0-9]+)"[^>]*\bcy="([0-9]+)"/.exec(presXml);
+  if (m) { SLIDE_W = parseInt(m[1], 10); SLIDE_H = parseInt(m[2], 10); }
+}
 
 const TITLE_MARKER = '<p:ph type="title"/>';   // title placeholder
 const BODY_MARKER = '<p:ph idx="1"/>';         // body placeholder
 const TITLE_ANCHOR_RU = "На тему";             // topic-line anchor in the title slide
 const TITLE_ANCHOR_EN = "Topic";               // English title-slide topic-line anchor
-const TITLE_ANCHOR = TITLE_ANCHOR_RU;          // kept for compatibility
 
 function topicAnchor(titleXml) {
   // Anchor present in the title slide: Russian first, then English;
@@ -610,21 +615,18 @@ const CONTENT_RELS = "ppt/slides/_rels/slide3.xml.rels";
 const TITLE_SLIDE = "ppt/slides/slide1.xml";
 const PLAN_SLIDE = "ppt/slides/slide2.xml";
 const CLOSE_SLIDE = "ppt/slides/slide4.xml";
-const SLIDE_ID_BASE = 274;   // new sldId ids (existing: 270,271,272,273)
-const RID_BASE = 11;         // new rIds (existing: rId1..rId10)
 const TITLE_PT = 36;         // fallback closing-slide title size (template declares its own in slide4)
 
 // geometry (EMU) for the PDF preview of a content slide
 const CONTENT_TITLE_OFF = { x: 466740, y: 548680, cx: 8229600, cy: 1143000 };
 const CONTENT_BODY_OFF = { x: 457200, y: 1600200, cx: 8229600, cy: 4525963 };
 
+// Body box [x, y, cx, cy] in EMU used when the template declares no body
+// placeholder geometry anywhere in the slide -> layout -> master chain.
+const DEFAULT_BOX = [457200, 1600200, 8229600, 4525963];
+const MASTER = "ppt/slideMasters/slideMaster1.xml";
+
 // fit estimate + table placement (the same constants as engine.py)
-const BODY_W = CONTENT_BODY_OFF.cx;      // body box width  (EMU)
-const BODY_H = CONTENT_BODY_OFF.cy;      // body box height (EMU)
-const BODY_W_IN = BODY_W / EMU_PER_INCH; // 9.0 in
-const BODY_H_IN = BODY_H / EMU_PER_INCH; // 4.95 in
-const BODY_OFF_X = CONTENT_BODY_OFF.x;   // body box offset (EMU)
-const BODY_OFF_Y = CONTENT_BODY_OFF.y;
 const AVG_CHAR_EM = 0.5;                 // em, average char width for the fit estimate
 const LINE_SPACING = 1.2;                // em, for the fit estimate
 
@@ -634,6 +636,18 @@ const TABLE_STYLE_DEFAULT = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}";
 const TABLE_GAP = 137160;                // gap above a table (EMU = 0.15in)
 const TABLE_CELL_PAD = 91440;            // cell top+bottom inset (EMU, 2 * 0.05in)
 const TABLE_MIN_COL_CHARS = 6;           // column-width floor in characters
+const TABLE_MIN_PT = 10;                 // smallest size a table shrinks to
+// `style:` option values; null keeps the template's default table style.
+const TABLE_STYLES = { "default": null,
+  "plain": "{2D5ABB26-0587-4C30-8999-92F81FD0307C}",   // No Style, No Grid
+  "grid": "{5940675A-B579-460E-94D1-54222C63F5DA}" };  // No Style, Table Grid
+
+// Charts: a <p:graphicFrame> whose <c:chart> points at ppt/charts/chartN.xml.
+const CHART_URI = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+const CHART_TYPES = ["column", "bar", "line", "pie"];   // bar = horizontal bars
+const CHART_MIN_H = 1828800;             // smallest height of a chart (2.0 in)
+const CHART_PT_BELOW_TABLE = 4;          // default chart text = table size - 4 pt
+const MAX_SERIES = 25;                   // workbook columns B..Z
 
 function esc(t) {
   return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -771,13 +785,207 @@ function endParaRpr(lang) {
   return "<a:endParaRPr/>";
 }
 
-function para(level, runs, base, lang) {
+// Numbered list items: "1. text" or "1) text" (engine.py:parse_numbered). The
+// scheme is the OOXML <a:buAutoNum type="..."> value.
+const NUMBERED_RE = /^([0-9]+)([.)])\s+(.*)$/;
+const NUM_SCHEME = { ".": "arabicPeriod", ")": "arabicParenR" };
+
+// [scheme, number, text] when `line` is a numbered list item, else null.
+function parseNumbered(line) {
+  const m = NUMBERED_RE.exec(line);
+  if (!m) return null;
+  return [NUM_SCHEME[m[2]], parseInt(m[1], 10), m[3]];
+}
+
+// Turn per-item marks into per-run marks (engine.py:group_numbering). `raw`
+// lists, in paragraph order, null (not numbered) or [scheme, number] as
+// written. A run is a maximal stretch of consecutive numbered items of one
+// scheme; PowerPoint numbers a run on its own, counting up from its first
+// item, so every item of a run gets [scheme, start] where `start` is the
+// number the run's first item was written with. Later numbers in a run are
+// ignored (CommonMark semantics).
+function groupNumbering(raw) {
+  const out = [];
+  let prev = null, start = null;
+  for (const mark of raw) {
+    if (mark === null) { prev = null; out.push(null); continue; }
+    if (mark[0] !== prev) start = mark[1];
+    prev = mark[0];
+    out.push([mark[0], start]);
+  }
+  return out;
+}
+
+// Replace the as-written numbers of a slide's text items with run marks.
+// Tables and charts are separate shapes, so they do not split a run: the
+// paragraphs PowerPoint sees in the body placeholder are contiguous.
+function numberSlideItems(parsed) {
+  const idx = [];
+  for (let k = 0; k < parsed.length; k++) if (typeof parsed[k][0] === "number") idx.push(k);
+  const marks = groupNumbering(idx.map(function (k) { return parsed[k][2]; }));
+  idx.forEach(function (k, n) { parsed[k] = [parsed[k][0], parsed[k][1], marks[n]]; });
+}
+
+// The text an item's auto-number is drawn as, per item (null when the item
+// is not numbered). PowerPoint numbers each run itself; the PDF preview has to
+// count the same way: a run restarts at its `start` after any unnumbered
+// item or a change of scheme.
+function numberLabels(items) {
+  const labels = [];
+  let prev = null, n = 0;
+  for (const num of items) {
+    if (!num) { prev = null; labels.push(null); continue; }
+    n = (num[0] === prev) ? n + 1 : num[1];
+    prev = num[0];
+    labels.push(n + (num[0] === "arabicParenR" ? ")" : "."));
+  }
+  return labels;
+}
+
+// Hanging indent (EMU, 0.25 in) given to a bullet or number the template's
+// list style leaves flush against its text.
+const HANG = 228600;
+
+// [marL, indent, bullet] a list-style block declares for 0-based `level`:
+// each null when it declares nothing; bullet is "none", "char", "autonum" or
+// "blip". `source` is the XML of an <a:lstStyle> or a <p:bodyStyle>
+// (engine.py:level_style).
+function levelStyle(source, level) {
+  const n = level + 1;
+  const m = new RegExp("<a:lvl" + n + "pPr\\b([^>]*?)(?:/>|>([\\s\\S]*?)</a:lvl" + n + "pPr>)").exec(source);
+  if (!m) return [null, null, null];
+  const head = m[1], inner = m[2] || "";
+  const ml = /\bmarL="(-?[0-9]+)"/.exec(head);
+  const ind = /\bindent="(-?[0-9]+)"/.exec(head);
+  let bullet = null;
+  const kinds = [["<a:buNone/>", "none"], ["<a:buChar", "char"], ["<a:buAutoNum", "autonum"], ["<a:buBlip", "blip"]];
+  for (const k of kinds) {
+    if (inner.indexOf(k[0]) >= 0) { bullet = k[1]; break; }
+  }
+  return [ml ? parseInt(ml[1], 10) : null, ind ? parseInt(ind[1], 10) : null, bullet];
+}
+
+// The list-style sources of a body placeholder: its own <a:lstStyle> (`block`
+// is its layout or slide <p:sp>), then the master's bodyStyle.
+function styleSources(block, masterXml) {
+  const sources = [];
+  if (block) {
+    const m = /<a:lstStyle>[\s\S]*?<\/a:lstStyle>/.exec(block);
+    sources.push(m ? m[0] : "");
+  }
+  if (masterXml) {
+    const m = /<p:bodyStyle>[\s\S]*?<\/p:bodyStyle>/.exec(masterXml);
+    sources.push(m ? m[0] : "");
+  }
+  return sources;
+}
+
+// Effective [marL, indent, bullet] of `level` in a body placeholder: the first
+// declaration of each in the sources wins (engine.py:effective_style).
+function effectiveStyle(block, masterXml, level) {
+  const out = [null, null, null];
+  for (const src of styleSources(block, masterXml)) {
+    const got = levelStyle(src, level);
+    for (let k = 0; k < 3; k++) if (out[k] === null) out[k] = got[k];
+  }
+  return out;
+}
+
+// [line, before, after] a list-style block declares for 0-based `level`, each
+// null when absent or ["pct" | "pts", n] as written (n in the file's
+// thousandths of a percent / hundredths of a point) (engine.py:level_spacing).
+function levelSpacing(source, level) {
+  const n = level + 1;
+  const m = new RegExp("<a:lvl" + n + "pPr\\b[^>]*?(?:/>|>([\\s\\S]*?)</a:lvl" + n + "pPr>)").exec(source);
+  const inner = m ? (m[1] || "") : "";
+  return ["lnSpc", "spcBef", "spcAft"].map(function (tag) {
+    const v = new RegExp("<a:" + tag + '><a:spc(Pct|Pts) val="(-?[0-9]+)"/></a:' + tag + ">").exec(inner);
+    return v ? [v[1].toLowerCase(), parseInt(v[2], 10)] : null;
+  });
+}
+
+// {level: [line %, before EMU, after EMU]} for levels 0 and 1 of a body
+// placeholder: the first declaration in its own <a:lstStyle>, then the
+// master's bodyStyle (line spacing 100 % and no space around paragraphs when
+// neither declares one). A percentage of space before/after is of the font
+// size `pt`; an exact line height is expressed as a percentage of the
+// estimate's single line (engine.py:effective_spacing).
+function effectiveSpacing(block, masterXml, pt) {
+  const sources = styleSources(block, masterXml);
+  const out = {};
+  for (const level of [0, 1]) {
+    const got = [null, null, null];
+    for (const src of sources) {
+      levelSpacing(src, level).forEach(function (v, k) { if (got[k] === null) got[k] = v; });
+    }
+    const emu = function (v) {
+      if (v === null) return 0;
+      return v[0] === "pct" ? Math.floor(v[1] * pt * 127 / 1000) : v[1] * 127;
+    };
+    const line = got[0];
+    let pct;
+    if (line === null) pct = 100;
+    else if (line[0] === "pct") pct = Math.floor(line[1] / 1000);
+    else pct = Math.floor(line[1] * 127 * 100 / lineEmu(pt));
+    out[level] = [pct, emu(got[1]), emu(got[2])];
+  }
+  return out;
+}
+
+// The <a:pPr> additions ([attrs, children] strings) that make a body
+// placeholder's lists read as the structure.md asks, where its effective list
+// style does not already:
+//   plain   a level-0 line carries no bullet (a template whose level 1 has
+//           one gets buNone and no indent)
+//   bullet  a `- ` item shows a bullet (a template with none gets "•")
+//   num     {level: ...} a numbered item hangs off its number
+// A marker the template leaves with no hanging indent (indent 0 or
+// undeclared) gets one of HANG EMU, the text moving right of the position the
+// template intended for the marker (engine.py:list_fixes).
+function listFixes(block, masterXml) {
+  const l0 = effectiveStyle(block, masterXml, 0);
+  const l1 = effectiveStyle(block, masterXml, 1);
+  const hang = function (st) {
+    if (st[1] === null || st[1] === 0) {
+      return ' marL="' + ((st[0] || 0) + HANG) + '" indent="' + (-HANG) + '"';
+    }
+    return "";
+  };
+  let plain = ["", ""];
+  if (l0[2] === "char" || l0[2] === "autonum" || l0[2] === "blip") {
+    plain = [' marL="0" indent="0"', "<a:buNone/>"];
+  }
+  let bullet = [hang(l1), ""];
+  if (l1[2] === null || l1[2] === "none") {
+    bullet = [hang(l1), '<a:buFont typeface="Arial"/><a:buChar char="\u2022"/>'];
+  }
+  return { plain: plain, bullet: bullet, num: { 0: [hang(l0), ""], 1: [hang(l1), ""] } };
+}
+
+// <a:pPr> of a body or plan paragraph (engine.py:para_props). `add` is
+// [attrs, children] from listFixes. A numbered paragraph swaps the inherited
+// bullet for auto-numbering in the text's own font (the indents come from the
+// template unless `add` gives them); `startAt` is written only when the run
+// does not start at 1.
+function paraProps(level, num, add) {
+  add = add || ["", ""];
+  let kids = add[1];
+  if (num) {
+    const startAt = num[1] !== 1 ? ' startAt="' + num[1] + '"' : "";
+    kids += '<a:buFontTx/><a:buAutoNum type="' + num[0] + '"' + startAt + "/>";
+  }
+  if (!kids) return '<a:pPr lvl="' + level + '"' + add[0] + "/>";
+  return '<a:pPr lvl="' + level + '"' + add[0] + ">" + kids + "</a:pPr>";
+}
+
+function para(level, runs, base, lang, num, add) {
   // Body paragraph. No size is stamped: runs inherit the template body font.
+  // `num` is the [scheme, start] run mark of a numbered item.
   // `base` is the original paragraph's first-run rPr: its typeface elements
   // (a:latin/a:cs/a:ea) are kept on every new run so the replaced text keeps
   // the template's font. `lang` (BCP-47) is stamped on every run and the end
   // mark so PowerPoint does not flag the text as misspelled.
-  const ppr = '<a:pPr lvl="' + level + '"/>';
+  const ppr = paraProps(level, num, add);
   const rs = runs.map(function (r) {
     return "<a:r>" + mergeRpr(base, r.slice(1), null, lang) + "<a:t>" + esc(r[0]) + "</a:t></a:r>";
   }).join("");
@@ -790,8 +998,10 @@ function titlePara(text, sz, base, lang) {
     "<a:t>" + esc(text) + "</a:t></a:r>" + endParaRpr(lang) + "</a:p>";
 }
 
-function tocPara(text, sz, base, lang) {
-  return '<a:p><a:pPr lvl="0"/>' +
+// Plan-slide item at `sz` pt; `num` is the [scheme, start] run mark when the
+// item is numbered.
+function tocPara(text, sz, base, lang, num, add) {
+  return "<a:p>" + paraProps(0, num, add) +
     "<a:r>" + mergeRpr(base, null, sz * 100, lang) +
     "<a:t>" + esc(text) + "</a:t></a:r>" + endParaRpr(lang) + "</a:p>";
 }
@@ -859,15 +1069,68 @@ function runsText(runs) {
   return out;
 }
 
-// Parse pipe-table lines into { header, align, cells } (the same rules as
-// engine.py:parse_table). A line is a row when it starts with "|"; cells are
-// split on "|" and trimmed, and the outer pipes are optional. A row of only
-// |, -, : and spaces is the header separator: it is dropped, marks the row
-// above as the header (rendered bold) and sets each column's alignment from
-// its colons (`:--` left, `--:` right, `:-:` centre). Ragged rows: extra
-// cells of a wide row drop, short rows pad; cells carry the same inline marks
-// as body lines.
-function parseTable(lines) {
+// ---- options lines (engine.py: parse_options) ----
+const TABLE_OPTION_KEYS = ["widths", "size", "header", "first-col", "banded", "style"];
+const CHART_OPTION_KEYS = ["chart", "title", "legend", "labels", "stacked", "size", "height"];
+
+function isOptionsLine(line) {
+  const s = line.trim();
+  return s.length >= 2 && s.startsWith("{") && s.endsWith("}");
+}
+
+// Key/value pairs of an options line `{key: value; key: value}`. The keys are
+// those of a table, or of a chart when `chart` is present; anything else is an
+// error, so a misspelt option never silently does nothing. Keys are
+// lower-cased, values keep their case (a chart title).
+function parseOptions(line) {
+  const opts = {};
+  for (let part of line.trim().slice(1, -1).split(";")) {
+    part = part.trim();
+    if (!part) continue;
+    const i = part.indexOf(":");
+    if (i < 0) {
+      throw new Error("option '" + part + "' in '" + line.trim() + "' needs the form key: value");
+    }
+    opts[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim();
+  }
+  const chart = "chart" in opts;
+  const allowed = chart ? CHART_OPTION_KEYS : TABLE_OPTION_KEYS;
+  for (const k of Object.keys(opts)) {
+    if (allowed.indexOf(k) < 0) {
+      throw new Error("unknown " + (chart ? "chart" : "table") + " option '" + k +
+        "' (allowed: " + allowed.join(", ") + ")");
+    }
+  }
+  return opts;
+}
+
+// An on/off option; `dflt` when absent.
+function optFlag(opts, key, dflt) {
+  const v = opts[key];
+  if (v === undefined) return dflt;
+  if (v.toLowerCase() === "on" || v.toLowerCase() === "off") return v.toLowerCase() === "on";
+  throw new Error("option " + key + " expects on or off, got '" + v + "'");
+}
+
+// A whole-number option in [lo, hi]; null when absent.
+function optInt(opts, key, lo, hi) {
+  const v = opts[key];
+  if (v === undefined) return null;
+  if (!/^[0-9]+$/.test(v) || parseInt(v, 10) < lo || parseInt(v, 10) > hi) {
+    throw new Error("option " + key + " expects a whole number from " + lo + " to " + hi +
+      ", got '" + v + "'");
+  }
+  return parseInt(v, 10);
+}
+
+// ---- tables (engine.py: split_table_rows, table_spans, parse_table) ----
+// Pipe-table lines -> { rows: cell strings, aligns, header }. A line is a row
+// when it starts with "|"; cells are split on "|" and trimmed, and the outer
+// pipes are optional. A row of only |, -, : and spaces is the header
+// separator: it is dropped, marks the row above as the header and sets each
+// column's alignment from its colons (`:--` left, `--:` right, `:-:` centre).
+// Short rows are padded to the widest one.
+function splitTableRows(lines) {
   const rows = [];
   let aligns = [], header = false;
   for (const ln of lines) {
@@ -889,43 +1152,367 @@ function parseTable(lines) {
     }
     rows.push(cells);
   }
-  if (!rows.length) return { header: false, align: [], cells: [] };
   let width = 0;
   for (const r of rows) width = Math.max(width, r.length);
   for (const r of rows) {
     if (r.length > width) r.length = width;
     while (r.length < width) r.push("");
   }
+  while (aligns.length < width) aligns.push(null);
+  return { rows: rows, aligns: aligns, header: header };
+}
+
+// Merge structure of a table whose merged cells are written `<<` (joins the
+// cell to its left) and `^^` (joins the cell above). Returns spans[r][c] =
+// [gridSpan, rowSpan, hMerge, vMerge]. A merge chain resolves to one origin
+// cell (a `<<` under a `^^` joins the same block), which carries the spans;
+// the cells it covers are flagged hMerge and/or vMerge, as PowerPoint writes
+// a merged range. A marker with no cell to join (first column / first row) is
+// ordinary text.
+function tableSpans(rows) {
+  const nrow = rows.length, ncol = rows[0].length;
+  const origin = [];
+  for (let r = 0; r < nrow; r++) {
+    origin.push([]);
+    for (let c = 0; c < ncol; c++) {
+      if (rows[r][c] === "<<" && c > 0) origin[r][c] = origin[r][c - 1];
+      else if (rows[r][c] === "^^" && r > 0) origin[r][c] = origin[r - 1][c];
+      else origin[r][c] = [r, c];
+    }
+  }
+  const grid = {}, rowsp = {};
+  for (let r = 0; r < nrow; r++) {
+    for (let c = 0; c < ncol; c++) {
+      const o = origin[r][c], key = o[0] + "," + o[1];
+      grid[key] = Math.max(grid[key] || 1, c - o[1] + 1);
+      rowsp[key] = Math.max(rowsp[key] || 1, r - o[0] + 1);
+    }
+  }
+  const spans = [];
+  for (let r = 0; r < nrow; r++) {
+    const row = [];
+    for (let c = 0; c < ncol; c++) {
+      const o = origin[r][c];
+      if (o[0] === r && o[1] === c) row.push([grid[r + "," + c], rowsp[r + "," + c], false, false]);
+      else row.push([1, 1, o[1] < c, o[0] < r]);
+    }
+    spans.push(row);
+  }
+  return spans;
+}
+
+// `widths: 3,1,1` -> relative column weights (whole numbers > 0), one per
+// column; null when absent.
+function parseWidths(opts, ncol) {
+  const v = opts.widths;
+  if (v === undefined) return null;
+  const parts = v.split(",").map(function (p) { return p.trim(); });
+  if (parts.length !== ncol || !parts.every(function (p) { return /^[0-9]+$/.test(p) && parseInt(p, 10) > 0; })) {
+    throw new Error("option widths expects " + ncol + " positive whole numbers separated by " +
+      "commas (one per column), got '" + v + "'");
+  }
+  return parts.map(function (p) { return parseInt(p, 10); });
+}
+
+// Parse pipe-table lines (see splitTableRows) into a table object:
+//   header     first row is bold (a separator row, or `header: on`)
+//   firstRow   tblPr firstRow flag (the style's header formatting)
+//   align      per-column "l" / "ctr" / "r" / null
+//   cells      [[runs]], runs carry the same inline marks as body lines
+//   spans      tableSpans(), parallel to cells
+//   widths     `widths:` weights or null
+//   pt         `size:` in points or null (null = the table may shrink)
+//   firstCol, banded, style   tblPr flags and the `style:` key
+// `opts` is the table's options line, see parseOptions (engine.py:parse_table).
+function parseTable(lines, opts) {
+  opts = opts || {};
+  const sp = splitTableRows(lines);
+  let header = sp.header;
+  if ("header" in opts) header = optFlag(opts, "header", header);
+  const style = (opts.style === undefined ? "default" : opts.style).toLowerCase();
+  if (!(style in TABLE_STYLES)) {
+    throw new Error("option style expects one of " + Object.keys(TABLE_STYLES).join(", ") +
+      ", got '" + opts.style + "'");
+  }
+  const spans = tableSpans(sp.rows);
   const cells = [];
-  for (let ri = 0; ri < rows.length; ri++) {
+  for (let ri = 0; ri < sp.rows.length; ri++) {
     const rr = [];
-    for (const cell of rows[ri]) {
-      let runs = parseInline(cell);
-      if (header && ri === 0) {
-        for (const r of runs) r[1] = true; // the header row is bold
+    for (let ci = 0; ci < sp.rows[ri].length; ci++) {
+      let runs;
+      if (spans[ri][ci][2] || spans[ri][ci][3]) {
+        runs = [];                                   // covered by a merge
+      } else {
+        runs = parseInline(sp.rows[ri][ci]);
+        if (header && ri === 0) {
+          for (const r of runs) r[1] = true;         // the header row is bold
+        }
       }
       rr.push(runs);
     }
     cells.push(rr);
   }
-  while (aligns.length < width) aligns.push(null);
-  return { header: header, align: aligns, cells: cells };
+  return { header: header, firstRow: "header" in opts ? header : true,
+    align: sp.aligns, cells: cells, spans: spans,
+    widths: parseWidths(opts, sp.aligns.length), pt: optInt(opts, "size", 8, 40),
+    firstCol: optFlag(opts, "first-col", false), banded: optFlag(opts, "banded", true),
+    style: style };
 }
 
-// Geometry (EMU) of one table in the body box: full body width, column widths
-// proportional to the longest cell of each column (floored at TABLE_MIN_COL_CHARS
-// characters, leftover EMU to the leftmost columns), row heights from the
-// wrapped-line estimate at the table text size plus the cell insets. `y` is
-// where the table starts in the body box (engine.py:table_geom).
-function tableGeom(tbl, y, tablePt) {
-  const ncol = tbl.align.length;
-  const weights = [];
-  for (let ci = 0; ci < ncol; ci++) {
-    let w = TABLE_MIN_COL_CHARS;
-    for (const row of tbl.cells) w = Math.max(w, runsText(row[ci]).length);
-    weights.push(w);
+// ---- charts (engine.py: parse_number, parse_chart) ----
+// A chart value: an optional sign, digits and one decimal separator. A comma
+// is a decimal comma ("1,5"); with both a comma and a point the commas are
+// thousands separators; spaces and a trailing % are ignored.
+function parseNumber(text) {
+  let t = text.replace(/\u00a0/g, "").replace(/ /g, "");
+  if (t.endsWith("%")) t = t.slice(0, -1);
+  if (t.indexOf(",") >= 0 && t.indexOf(".") >= 0) t = t.replace(/,/g, "");
+  else if (t.indexOf(",") >= 0) t = t.replace(/,/g, ".");
+  if (!/^[+-]?[0-9]+(\.[0-9]+)?$/.test(t)) {
+    throw new Error("chart value '" + text + "' is not a number");
   }
-  const total = Math.floor(BODY_W);
+  const v = Number(t);
+  if (Math.abs(v) >= 1e15 || (!Number.isInteger(v) && Math.abs(v) < 1e-4)) {
+    throw new Error("chart value '" + text + "' is out of the supported range");
+  }
+  return v;
+}
+
+// A number as written into chart XML and the workbook.
+function fmtNum(v) {
+  return String(v);
+}
+
+// Chart object from pipe-table lines and the chart's options line. The first
+// row names the series, the first column holds the categories and every other
+// cell is a number. A pie uses only the first series.
+function parseChart(lines, opts) {
+  const kind = opts.chart.toLowerCase();
+  if (CHART_TYPES.indexOf(kind) < 0) {
+    throw new Error("option chart expects one of " + CHART_TYPES.join(", ") + ", got '" + opts.chart + "'");
+  }
+  const rows = splitTableRows(lines).rows;
+  if (rows.length < 2 || rows[0].length < 2) {
+    throw new Error("a chart table needs a header row, at least one category row and one series column");
+  }
+  if (rows[0].length - 1 > MAX_SERIES) {
+    throw new Error("a chart supports at most " + MAX_SERIES + " series");
+  }
+  const plain = function (cell) { return runsText(parseInline(cell)); };
+  const cats = rows.slice(1).map(function (r) { return plain(r[0]); });
+  const series = [];
+  for (let j = 1; j < rows[0].length; j++) {
+    series.push([plain(rows[0][j]), rows.slice(1).map(function (r) { return parseNumber(r[j]); })]);
+  }
+  let legend = opts.legend;
+  if (legend !== undefined && ["top", "bottom", "left", "right", "off"].indexOf(legend.toLowerCase()) < 0) {
+    throw new Error("option legend expects top, bottom, left, right or off, got '" + legend + "'");
+  }
+  const stacked = optFlag(opts, "stacked", false);
+  if (stacked && kind !== "column" && kind !== "bar") {
+    throw new Error("option stacked applies to column and bar charts");
+  }
+  let height = null;
+  if ("height" in opts) {
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(opts.height) || parseFloat(opts.height) < 1 || parseFloat(opts.height) > 7) {
+      throw new Error("option height expects inches from 1 to 7, got '" + opts.height + "'");
+    }
+    height = Math.floor(parseFloat(opts.height) * EMU_PER_INCH + 0.5);
+  }
+  return { type: kind, title: opts.title === undefined ? null : opts.title, cats: cats,
+    series: kind !== "pie" ? series : series.slice(0, 1),
+    legend: legend ? legend.toLowerCase() : null,
+    labels: optFlag(opts, "labels", false), stacked: stacked,
+    pt: optInt(opts, "size", 8, 40), height: height };
+}
+
+// ---- template geometry (engine.py: sp_block ... plan_slide) ----
+// `geo` maps part name -> XML text for the slide master and every layout.
+const XFRM_RE = /<a:off x="(-?[0-9]+)" y="(-?[0-9]+)"\/><a:ext cx="([0-9]+)" cy="([0-9]+)"\/>/;
+
+// The <p:sp>...</p:sp> containing `marker`, or null.
+function spBlock(xml, marker) {
+  const i = xml.indexOf(marker);
+  if (i === -1) return null;
+  const start = xml.lastIndexOf("<p:sp>", i);
+  return xml.slice(start, xml.indexOf("</p:sp>", i) + "</p:sp>".length);
+}
+
+// [x, y, cx, cy] in EMU declared in a shape's spPr, or null when the shape
+// inherits its geometry.
+function spBox(block) {
+  if (block === null) return null;
+  const m = XFRM_RE.exec(block.split("<p:txBody>")[0]);
+  return m ? [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10), parseInt(m[4], 10)] : null;
+}
+
+// A layout placeholder with idx at or above this carries PowerPoint's "no
+// index" sentinel (4294967295): no slide placeholder can be linked to it by
+// idx, and several of them can share the value.
+const SENTINEL_IDX = 4294967000;
+
+// Body placeholders of a layout as [idx, <p:ph> tag, box or null, <p:sp>
+// block], ordered by idx and then left to right, top to bottom (placeholders
+// that share the sentinel idx are told apart by position). Footer, date,
+// slide number, picture and vertical-text placeholders are not body
+// placeholders.
+function bodyPhs(layoutXml) {
+  const out = [];
+  for (const sp of (layoutXml.match(/<p:sp>[\s\S]*?<\/p:sp>/g) || [])) {
+    const m = /<p:ph\b[^>]*\/>/.exec(sp);
+    if (!m) continue;
+    const tag = m[0];
+    const idx = /\bidx="([0-9]+)"/.exec(tag);
+    const typ = /\btype="([^"]+)"/.exec(tag);
+    if (!idx || (typ && typ[1] !== "body" && typ[1] !== "obj")) continue;
+    if (tag.indexOf('orient="vert"') >= 0) continue;
+    out.push([parseInt(idx[1], 10), tag, spBox(sp), sp]);
+  }
+  out.sort(function (a, b) {
+    return (a[0] - b[0]) || ((a[2] ? a[2][0] : 0) - (b[2] ? b[2][0] : 0)) ||
+      ((a[2] ? a[2][1] : 0) - (b[2] ? b[2][1] : 0));
+  });
+  return out;
+}
+
+// The slide master's body placeholder box, the end of the geometry chain.
+function masterBodyBox(geo) {
+  const xml = geo[MASTER];
+  if (xml === undefined) return DEFAULT_BOX;
+  return spBox(spBlock(xml, '<p:ph type="body" idx="1"/>')) || DEFAULT_BOX;
+}
+
+// The slide layout part a slide's rels point at, or null.
+function layoutFile(relsXml) {
+  const m = /Target="[^"]*(slideLayout[0-9]+\.xml)"/.exec(relsXml);
+  return m ? "ppt/slideLayouts/" + m[1] : null;
+}
+
+// The <p:sp> of the layout (named by a slide's rels) body placeholder with
+// this idx, or null.
+function layoutBodyBlock(geo, relsXml, idx) {
+  const lay = geo[layoutFile(relsXml) || ""];
+  if (lay !== undefined) {
+    for (const ph of bodyPhs(lay)) if (ph[0] === idx) return ph[3];
+  }
+  return null;
+}
+
+// [box, layout block] of the clone prototype's body placeholder. The box is
+// the slide's own geometry, else its layout's, else the master's; the block is
+// the layout's placeholder (null without one).
+function defaultBody(geo, contentXml, contentRels) {
+  const block = layoutBodyBlock(geo, contentRels, 1);
+  const box = spBox(spBlock(contentXml, BODY_MARKER)) || spBox(block);
+  return [box || masterBodyBox(geo), block];
+}
+
+// [file, name, hasTitle, bodyPhs] of every layout, in numeric order.
+function layoutCatalog(geo) {
+  const files = Object.keys(geo).filter(function (n) {
+    return /^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/.test(n);
+  }).sort(function (a, b) {
+    return parseInt(/([0-9]+)\.xml$/.exec(a)[1], 10) - parseInt(/([0-9]+)\.xml$/.exec(b)[1], 10);
+  });
+  return files.map(function (f) {
+    const x = geo[f];
+    const nm = /<p:cSld name="([^"]*)"/.exec(x);
+    return [f, nm ? nm[1] : "", x.indexOf('<p:ph type="title"/>') >= 0, bodyPhs(x)];
+  });
+}
+
+// A title plus exactly two body placeholders sitting side by side.
+function isTwoContent(entry, masterBox) {
+  const hasTitle = entry[2], phs = entry[3];
+  if (!hasTitle || phs.length !== 2) return false;
+  const a = phs[0][2] || masterBox, b = phs[1][2] || masterBox;
+  return a[1] === b[1] && a[0] + a[2] <= b[0];
+}
+
+// Font size in points declared anywhere in a <p:sp> block, or null.
+function blockSz(block) {
+  const m = /sz="(\d+)"/.exec(block || "");
+  return m ? Math.floor(parseInt(m[1], 10) / 100) : null;
+}
+
+// Where a slide's columns go: { file: layout part or null for the clone
+// prototype's own layout, phs: one object per column }. A column object has:
+//   tag     the <p:ph> tag the slide's placeholder carries
+//   box     [x, y, cx, cy] EMU of the column
+//   pt      the column's body text size for the fit estimate: the size the
+//           layout placeholder declares, else `bodyPt`
+//   block   the layout's <p:sp> for the placeholder (its list style)
+//   orphan  true when the layout placeholder has the sentinel idx; the slide
+//           placeholder then gets its own unique sentinel idx, the box as an
+//           explicit xfrm and a copy of the list style, because nothing can
+//           link it to the layout placeholder
+//   spacing effectiveSpacing() at the column's size
+// `dflt` is defaultBody()'s [box, block] (engine.py:plan_slide).
+function planSlide(geo, dflt, bodyPt, layoutKey, ncols) {
+  const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
+  if (layoutKey === null && ncols === 1) {
+    return { file: null, phs: [{ tag: BODY_MARKER, box: dflt[0], pt: bodyPt, block: dflt[1],
+      orphan: false, spacing: effectiveSpacing(dflt[1], masterXml, bodyPt) }] };
+  }
+  const catalog = layoutCatalog(geo);
+  const masterBox = masterBodyBox(geo);
+  let found;
+  if (layoutKey === null || layoutKey.toLowerCase() === "two-content") {
+    found = catalog.filter(function (c) { return isTwoContent(c, masterBox); });
+    if (!found.length) {
+      throw new Error("the template has no two-content layout (a title plus two side-by-side body placeholders)");
+    }
+  } else {
+    found = catalog.filter(function (c) { return c[1].toLowerCase() === layoutKey.toLowerCase(); });
+    if (!found.length) {
+      throw new Error("layout '" + layoutKey + "' not found in the template (layouts: " +
+        catalog.map(function (c) { return "'" + c[1] + "'"; }).join(", ") + ")");
+    }
+  }
+  const name = found[0][1], hasTitle = found[0][2], phs = found[0][3];
+  if (!hasTitle || phs.length !== ncols) {
+    throw new Error("layout '" + name + "' has " + (hasTitle ? "a title" : "no title") + " and " +
+      phs.length + " body placeholder(s), but the slide has " + ncols +
+      " column(s) (two columns need ::: left and ::: right blocks)");
+  }
+  const out = [];
+  let orphans = 0;
+  for (const ph of phs) {
+    let tag = ph[1];
+    const orphan = ph[0] >= SENTINEL_IDX;
+    if (orphan) {
+      tag = tag.replace(/\bidx="[0-9]+"/, 'idx="' + (4294967295 - orphans) + '"');
+      orphans += 1;
+    }
+    const pt = blockSz(ph[3]) || bodyPt;
+    out.push({ tag: tag, box: ph[2] || masterBox, pt: pt, block: ph[3], orphan: orphan,
+      spacing: effectiveSpacing(ph[3], masterXml, pt) });
+  }
+  return { file: found[0][0], phs: out };
+}
+
+// ---- layout flow (engine.py: table_geom, column_flow) ----
+// Geometry (EMU) of one table `total` EMU wide at (x, y): column widths from
+// the `widths:` weights, else proportional to the longest cell of each column
+// (floored at TABLE_MIN_COL_CHARS characters; merged cells do not count),
+// leftover EMU to the leftmost columns; row heights from the wrapped-line
+// estimate at `pt` plus the cell insets. A cell spanning columns wraps at the
+// width of the columns it covers; a cell spanning rows does not set a row
+// height.
+function tableGeom(tbl, x, total, y, pt) {
+  const ncol = tbl.align.length;
+  const spans = tbl.spans;
+  let weights = tbl.widths;
+  if (!weights) {
+    weights = [];
+    for (let ci = 0; ci < ncol; ci++) {
+      let w = TABLE_MIN_COL_CHARS;
+      for (let ri = 0; ri < tbl.cells.length; ri++) {
+        if (spans[ri][ci][0] === 1) w = Math.max(w, runsText(tbl.cells[ri][ci]).length);
+      }
+      weights.push(w);
+    }
+  }
   let s = 0;
   for (const w of weights) s += w;
   const colW = weights.map(function (w) { return Math.floor(total * w / s); });
@@ -933,55 +1520,104 @@ function tableGeom(tbl, y, tablePt) {
   for (const w of colW) rest -= w;
   for (let ci = 0; ci < rest; ci++) colW[ci] += 1;
   const rowH = [];
-  for (const row of tbl.cells) {
+  for (let ri = 0; ri < tbl.cells.length; ri++) {
     let lines = 1;
-    for (let ci = 0; ci < row.length; ci++) {
-      lines = Math.max(lines, estLines(runsText(row[ci]), colW[ci] / EMU_PER_INCH, tablePt));
+    for (let ci = 0; ci < tbl.cells[ri].length; ci++) {
+      const sp = spans[ri][ci];
+      if (sp[2] || sp[3] || sp[1] > 1) continue;
+      let wsum = 0;
+      for (let k = ci; k < ci + sp[0]; k++) wsum += colW[k];
+      lines = Math.max(lines, estLines(runsText(tbl.cells[ri][ci]), wsum / EMU_PER_INCH, pt));
     }
-    rowH.push(lines * lineEmu(tablePt) + TABLE_CELL_PAD);
+    rowH.push(lines * lineEmu(pt) + TABLE_CELL_PAD);
   }
   let cx = 0;
   for (const w of colW) cx += w;
   let cy = 0;
   for (const h of rowH) cy += h;
-  return { x: BODY_OFF_X, y: y, cx: cx, cy: cy, colW: colW, rowH: rowH };
+  return { x: x, y: y, cx: cx, cy: cy, colW: colW, rowH: rowH };
 }
 
-// Vertical flow of one content slide, from the body-box top (engine.py:
-// slide_layout). A text placeholder flows all of its paragraphs from the top
-// of the body box, so a table — a separate <p:graphicFrame> shape — always
-// sits below them: the text height is estimated first, then the tables stack
-// in document order, each TABLE_GAP under the previous block. Returns
-// { hEmu, tables: [[tbl, geom]] }, the estimate fitCheck compares with the
-// body box.
-function slideLayout(parsed, bodyPt, tablePt) {
+// Vertical flow of one column inside its body `box` [x, y, cx, cy]. A text
+// placeholder flows all of its own paragraphs from the top of the box, so
+// tables and charts - separate <p:graphicFrame> shapes - sit below them: the
+// text height is estimated first (the same average-character heuristic as
+// the fit estimate), then the blocks stack in document order, each TABLE_GAP
+// under the previous one. Tables without a `size:` shrink one point at a time
+// (down to TABLE_MIN_PT) while the column overflows; charts without a
+// `height:` then share the space that is left, at least CHART_MIN_H each.
+// `spacing` is effectiveSpacing()'s {level: [line %, before EMU, after EMU]}:
+// each paragraph's lines are scaled by the line spacing and followed by the
+// space around it. Returns { hEmu: total height, pt: table size used, frames:
+// [[kind, table or chart, geom]] }.
+function columnFlow(items, box, bodyPt, tablePt, spacing) {
+  const bx = box[0], by = box[1], bw = box[2], bh = box[3];
+  const widthIn = bw / EMU_PER_INCH;
+  spacing = spacing || { 0: [100, 0, 0], 1: [100, 0, 0] };
   let textEmu = 0;
-  for (const item of parsed) {
-    if (item[0] !== "table") {
-      textEmu += estLines(runsText(item[1]), BODY_W_IN, bodyPt) * lineEmu(bodyPt);
+  const blocks = [];
+  for (const it of items) {
+    if (typeof it[0] === "number") {
+      const sp = spacing[it[0]];
+      textEmu += estLines(runsText(it[1]), widthIn, bodyPt) *
+        Math.floor(lineEmu(bodyPt) * sp[0] / 100) + sp[1] + sp[2];
+    } else {
+      blocks.push(it);
     }
   }
-  let y = Math.floor(BODY_OFF_Y) + textEmu;
-  let h = textEmu;
-  const tables = [];
-  for (const item of parsed) {
-    if (item[0] === "table") {
+  const flex = blocks.filter(function (b) { return b[0] === "chart" && b[1].height === null; }).length;
+  const shrinkable = blocks.some(function (b) { return b[0] === "table" && b[1].pt === null; });
+
+  function place(pt, flexH) {
+    let y = by + textEmu;
+    let h = textEmu;
+    const frames = [];
+    for (const b of blocks) {
       y += TABLE_GAP;
       h += TABLE_GAP;
-      const geom = tableGeom(item[1], y, tablePt);
-      tables.push([item[1], geom]);
+      let geom;
+      if (b[0] === "table") {
+        geom = tableGeom(b[1], bx, bw, y, b[1].pt || pt);
+        geom.pt = b[1].pt || pt;
+      } else {
+        geom = { x: bx, y: y, cx: bw, cy: b[1].height || flexH };
+      }
+      frames.push([b[0], b[1], geom]);
       y += geom.cy;
       h += geom.cy;
     }
+    return { h: h, frames: frames };
   }
-  return { hEmu: h, tables: tables };
+
+  let pt = tablePt;
+  let r = place(pt, CHART_MIN_H);
+  while (shrinkable && r.h > bh && pt > TABLE_MIN_PT) {
+    pt -= 1;
+    r = place(pt, CHART_MIN_H);
+  }
+  if (flex && r.h < bh) {
+    r = place(pt, CHART_MIN_H + Math.floor((bh - r.h) / flex));
+  }
+  return { hEmu: r.h, pt: pt, frames: r.frames };
 }
 
 // One paragraph of a table cell (engine.py:cell_para). `runs` are
 // [text, bold, italic, underline] runs; `sz` is in points and always stamped —
 // a cell has no placeholder to inherit a size from. `algn` is stamped only for
 // "ctr"/"r" (left is the OOXML default). An empty cell is the bare <a:p/>.
-function cellPara(runs, algn, sz, base, lang) {
+// `rpr` (an <a:rPr> element) with `fill` (an <a:solidFill>) as its first
+// child; run properties that already carry a fill are kept as they are
+// (engine.py:add_fill).
+function addFill(rpr, fill) {
+  if (!fill || rpr.indexOf("<a:solidFill>") >= 0) return rpr;
+  if (rpr.endsWith("/>")) return rpr.slice(0, -2) + ">" + fill + "</a:rPr>";
+  const i = rpr.indexOf(">") + 1;
+  return rpr.slice(0, i) + fill + rpr.slice(i);
+}
+
+// `fill` is a text colour (<a:solidFill>) for cells whose table style gives
+// none.
+function cellPara(runs, algn, sz, base, lang, fill) {
   let hasText = false;
   for (const r of runs) if (r[0]) hasText = true;
   if (!hasText) return "<a:p/>";
@@ -989,23 +1625,31 @@ function cellPara(runs, algn, sz, base, lang) {
   let rs = "";
   for (const r of runs) {
     if (!r[0]) continue;
-    rs += "<a:r>" + mergeRpr(base, r.slice(1), sz ? sz * 100 : null, lang) +
+    rs += "<a:r>" + addFill(mergeRpr(base, r.slice(1), sz ? sz * 100 : null, lang), fill) +
       "<a:t>" + esc(r[0]) + "</a:t></a:r>";
   }
   return "<a:p>" + ppr + rs + endParaRpr(lang) + "</a:p>";
 }
 
-// One <a:tc> cell: text body first, then the (empty) cell properties — the
-// order the TableCellBase type requires (engine.py:cell_xml).
-function cellXml(cell, algn, sz, base, lang) {
-  return "<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>" + cellPara(cell, algn, sz, base, lang) +
-    "</a:txBody><a:tcPr/></a:tc>";
+// One <a:tc> cell: text body first, then the (empty) cell properties - the
+// order the TableCellBase type requires (engine.py:cell_xml). `span` is the
+// cell's entry in tableSpans: the origin of a merge carries gridSpan/rowSpan,
+// the cells it covers carry hMerge/vMerge (and stay in the grid, empty).
+function cellXml(cell, algn, sz, base, lang, span, fill) {
+  span = span || [1, 1, false, false];
+  let attrs = "";
+  if (span[0] > 1) attrs += ' gridSpan="' + span[0] + '"';
+  if (span[1] > 1) attrs += ' rowSpan="' + span[1] + '"';
+  if (span[2]) attrs += ' hMerge="1"';
+  if (span[3]) attrs += ' vMerge="1"';
+  return "<a:tc" + attrs + "><a:txBody><a:bodyPr/><a:lstStyle/>" +
+    cellPara(cell, algn, sz, base, lang, fill) + "</a:txBody><a:tcPr/></a:tc>";
 }
 
-// One <p:graphicFrame> carrying an <a:tbl> — the OOXML form PowerPoint writes
+// One <p:graphicFrame> carrying an <a:tbl> - the OOXML form PowerPoint writes
 // for a slide table (a table can never live inside a text placeholder, so it
 // is a separate shape in <p:spTree>) (engine.py:table_frame_xml).
-function tableFrameXml(tbl, geom, styleId, sz, base, lang, shapeId, nameNo) {
+function tableFrameXml(tbl, geom, styleId, sz, base, lang, shapeId, nameNo, fill) {
   const rows = tbl.cells, aligns = tbl.align;
   let grid = "";
   for (const w of geom.colW) grid += '<a:gridCol w="' + w + '"/>';
@@ -1013,19 +1657,413 @@ function tableFrameXml(tbl, geom, styleId, sz, base, lang, shapeId, nameNo) {
   for (let ri = 0; ri < rows.length; ri++) {
     let cells = "";
     for (let ci = 0; ci < rows[ri].length; ci++) {
-      cells += cellXml(rows[ri][ci], ci < aligns.length ? aligns[ci] : null, sz, base, lang);
+      cells += cellXml(rows[ri][ci], ci < aligns.length ? aligns[ci] : null, sz, base, lang,
+        tbl.spans[ri][ci], fill);
     }
     trs.push('<a:tr h="' + geom.rowH[ri] + '">' + cells + "</a:tr>");
   }
+  let flags = "";
+  if (tbl.firstRow) flags += ' firstRow="1"';
+  if (tbl.firstCol) flags += ' firstCol="1"';
+  if (tbl.banded) flags += ' bandRow="1"';
   return '<p:graphicFrame><p:nvGraphicFramePr>' +
     '<p:cNvPr id="' + shapeId + '" name="Table ' + nameNo + '"/>' +
     '<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr>' +
     '<p:nvPr/></p:nvGraphicFramePr>' +
     '<p:xfrm><a:off x="' + geom.x + '" y="' + geom.y + '"/><a:ext cx="' + geom.cx + '" cy="' + geom.cy + '"/></p:xfrm>' +
     '<a:graphic><a:graphicData uri="' + TABLE_URI + '"><a:tbl>' +
-    '<a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>' + styleId + "</a:tableStyleId></a:tblPr>" +
+    "<a:tblPr" + flags + "><a:tableStyleId>" + styleId + "</a:tableStyleId></a:tblPr>" +
     "<a:tblGrid>" + grid + "</a:tblGrid>" + trs.join("") +
     "</a:tbl></a:graphicData></a:graphic></p:graphicFrame>";
+}
+
+// ---- chart parts (engine.py: chart_xml and friends) ----
+// Workbook column letter for a 0-based column index (A..Z).
+function colLetter(j) {
+  return String.fromCharCode(65 + j);
+}
+
+function cStrCache(vals) {
+  return '<c:strCache><c:ptCount val="' + vals.length + '"/>' + vals.map(function (v, i) {
+    return '<c:pt idx="' + i + '"><c:v>' + esc(v) + "</c:v></c:pt>";
+  }).join("") + "</c:strCache>";
+}
+
+function cNumCache(vals) {
+  return "<c:numCache><c:formatCode>General</c:formatCode>" +
+    '<c:ptCount val="' + vals.length + '"/>' + vals.map(function (v, i) {
+      return '<c:pt idx="' + i + '"><c:v>' + fmtNum(v) + "</c:v></c:pt>";
+    }).join("") + "</c:numCache>";
+}
+
+// One <c:ser>. Colours are theme accents (accent1..accent6, cycling), so the
+// template's palette applies; the child order is the one CT_BarSer /
+// CT_LineSer / CT_PieSer require.
+function cSeries(ch, j, name, vals) {
+  const n = ch.cats.length;
+  const letter = colLetter(j + 1);
+  const kind = ch.type;
+  const accent = '<a:solidFill><a:schemeClr val="accent' + (j % 6 + 1) + '"/></a:solidFill>';
+  const out = ['<c:idx val="' + j + '"/><c:order val="' + j + '"/>',
+    "<c:tx><c:strRef><c:f>Sheet1!$" + letter + "$1</c:f>" + cStrCache([name]) + "</c:strRef></c:tx>"];
+  if (kind === "column" || kind === "bar") {
+    out.push("<c:spPr>" + accent + '</c:spPr><c:invertIfNegative val="0"/>');
+  } else if (kind === "line") {
+    out.push('<c:spPr><a:ln w="28575" cap="rnd">' + accent + "<a:round/></a:ln></c:spPr>" +
+      '<c:marker><c:symbol val="circle"/><c:size val="7"/>' +
+      "<c:spPr>" + accent + '<a:ln w="9525">' + accent + "</a:ln></c:spPr></c:marker>");
+  } else {
+    for (let i = 0; i < n; i++) {
+      out.push('<c:dPt><c:idx val="' + i + '"/><c:bubble3D val="0"/><c:spPr>' +
+        '<a:solidFill><a:schemeClr val="accent' + (i % 6 + 1) + '"/></a:solidFill>' +
+        '<a:ln w="19050"><a:solidFill><a:schemeClr val="bg1"/>' +
+        "</a:solidFill></a:ln></c:spPr></c:dPt>");
+    }
+  }
+  if (ch.labels) {
+    const pie = kind === "pie";
+    out.push('<c:dLbls><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>' +
+      '<c:showLegendKey val="0"/><c:showVal val="' + (pie ? 0 : 1) + '"/>' +
+      '<c:showCatName val="0"/><c:showSerName val="0"/>' +
+      '<c:showPercent val="' + (pie ? 1 : 0) + '"/><c:showBubbleSize val="0"/></c:dLbls>');
+  }
+  out.push("<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$" + (n + 1) + "</c:f>" + cStrCache(ch.cats) + "</c:strRef></c:cat>");
+  out.push("<c:val><c:numRef><c:f>Sheet1!$" + letter + "$2:$" + letter + "$" + (n + 1) + "</c:f>" +
+    cNumCache(vals) + "</c:numRef></c:val>");
+  if (kind === "line") out.push('<c:smooth val="0"/>');
+  return "<c:ser>" + out.join("") + "</c:ser>";
+}
+
+// <c:plotArea>: the chart group and, except for a pie, the two axes. A
+// horizontal bar chart reverses its category axis so the first row is on top,
+// and its value axis crosses at the far end to stay at the bottom.
+function cPlotArea(ch) {
+  const kind = ch.type;
+  const sers = ch.series.map(function (s, j) { return cSeries(ch, j, s[0], s[1]); }).join("");
+  const axes = '<c:axId val="111111111"/><c:axId val="222222222"/>';
+  let group;
+  if (kind === "column" || kind === "bar") {
+    const stacked = ch.stacked;
+    group = '<c:barChart><c:barDir val="' + (kind === "column" ? "col" : "bar") + '"/><c:grouping val="' +
+      (stacked ? "stacked" : "clustered") + '"/><c:varyColors val="0"/>' + sers +
+      '<c:gapWidth val="' + (stacked ? 100 : 80) + '"/>' + (stacked ? '<c:overlap val="100"/>' : "") +
+      axes + "</c:barChart>";
+  } else if (kind === "line") {
+    group = '<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>' + sers +
+      '<c:marker val="1"/>' + axes + "</c:lineChart>";
+  } else {
+    return '<c:plotArea><c:layout/><c:pieChart><c:varyColors val="1"/>' + sers +
+      '<c:firstSliceAng val="0"/></c:pieChart></c:plotArea>';
+  }
+  const horiz = kind === "bar";
+  const catAx = '<c:catAx><c:axId val="111111111"/><c:scaling><c:orientation val="' +
+    (horiz ? "maxMin" : "minMax") + '"/></c:scaling><c:delete val="0"/><c:axPos val="' + (horiz ? "l" : "b") + '"/>' +
+    '<c:numFmt formatCode="General" sourceLinked="1"/>' +
+    '<c:majorTickMark val="none"/><c:minorTickMark val="none"/>' +
+    '<c:tickLblPos val="nextTo"/><c:spPr><a:ln w="9525"><a:solidFill>' +
+    '<a:srgbClr val="BFBFBF"/></a:solidFill></a:ln></c:spPr>' +
+    '<c:crossAx val="222222222"/><c:crosses val="autoZero"/>' +
+    '<c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>' +
+    '<c:noMultiLvlLbl val="0"/></c:catAx>';
+  const valAx = '<c:valAx><c:axId val="222222222"/><c:scaling><c:orientation ' +
+    'val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="' + (horiz ? "b" : "l") + '"/>' +
+    '<c:majorGridlines><c:spPr><a:ln w="9525"><a:solidFill>' +
+    '<a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></c:spPr>' +
+    '</c:majorGridlines><c:numFmt formatCode="General" sourceLinked="1"/>' +
+    '<c:majorTickMark val="none"/><c:minorTickMark val="none"/>' +
+    '<c:tickLblPos val="nextTo"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>' +
+    '<c:crossAx val="111111111"/><c:crosses val="' + (horiz ? "max" : "autoZero") + '"/>' +
+    '<c:crossBetween val="between"/></c:valAx>';
+  return "<c:plotArea><c:layout/>" + group + catAx + valAx + "</c:plotArea>";
+}
+
+// The ppt/charts/chartN.xml part. `pt` is the text size in points, `font` the
+// typeface of the template's body text (null = the theme font), `lang` the
+// declared proofing language. The chart background is transparent so the
+// slide background shows through.
+function chartXml(ch, pt, lang, font, color) {
+  color = color || "";
+  const langAttr = lang ? ' lang="' + lang + '"' : "";
+  const face = font ? '<a:latin typeface="' + esc(font) + '"/><a:cs typeface="' + esc(font) + '"/>' : "";
+  let title;
+  if (ch.title) {
+    title = '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr>' +
+      '<a:defRPr sz="' + (pt + 2) * 100 + '" b="1">' + color + '</a:defRPr></a:pPr><a:r><a:rPr' + langAttr +
+      ' sz="' + (pt + 2) * 100 + '" b="1">' + color + '</a:rPr>' +
+      "<a:t>" + esc(ch.title) + '</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/>' +
+      '</c:title><c:autoTitleDeleted val="0"/>';
+  } else {
+    title = '<c:autoTitleDeleted val="1"/>';
+  }
+  let legend = ch.legend;
+  if (legend === null) {
+    legend = ch.type === "pie" ? "right" : (ch.series.length > 1 ? "bottom" : "off");
+  }
+  const legendXml = legend === "off" ? "" :
+    '<c:legend><c:legendPos val="' + { top: "t", bottom: "b", left: "l", right: "r" }[legend] +
+    '"/><c:overlay val="0"/></c:legend>';
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<c:chartSpace xmlns:c="' + CHART_URI + '" ' +
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+    '<c:date1904 val="0"/><c:roundedCorners val="0"/>' +
+    "<c:chart>" + title + cPlotArea(ch) + legendXml + '<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/>' +
+    "</c:chart><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>" +
+    '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="' + pt * 100 + '">' + color + face +
+    "</a:defRPr></a:pPr><a:endParaRPr" + langAttr + "/></a:p></c:txPr>" +
+    '<c:externalData r:id="rId1"><c:autoUpdate val="0"/></c:externalData>' +
+    "</c:chartSpace>";
+}
+
+// The <p:graphicFrame> that places a chart part on the slide.
+function chartFrameXml(geom, rid, shapeId, nameNo) {
+  return '<p:graphicFrame><p:nvGraphicFramePr>' +
+    '<p:cNvPr id="' + shapeId + '" name="Chart ' + nameNo + '"/>' +
+    '<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr>' +
+    '<p:nvPr/></p:nvGraphicFramePr>' +
+    '<p:xfrm><a:off x="' + geom.x + '" y="' + geom.y + '"/><a:ext cx="' + geom.cx + '" cy="' + geom.cy + '"/></p:xfrm>' +
+    '<a:graphic><a:graphicData uri="' + CHART_URI + '">' +
+    '<c:chart xmlns:c="' + CHART_URI + '" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ' +
+    'r:id="' + rid + '"/></a:graphicData></a:graphic></p:graphicFrame>';
+}
+
+// The minimal .xlsx behind a chart (what PowerPoint opens for "Edit Data"):
+// A2.. categories, B1.. series names, B2.. values on Sheet1, text as inline
+// strings. Entries carry a fixed timestamp so the bytes depend only on the
+// data. Resolves to a Uint8Array.
+async function workbookBytes(ch) {
+  const textCell = function (ref, t) {
+    return '<c r="' + ref + '" t="inlineStr"><is><t xml:space="preserve">' + esc(t) + "</t></is></c>";
+  };
+  const rows = ['<row r="1">' + ch.series.map(function (s, j) {
+    return textCell(colLetter(j + 1) + "1", s[0]);
+  }).join("") + "</row>"];
+  for (let i = 0; i < ch.cats.length; i++) {
+    let cells = textCell("A" + (i + 2), ch.cats[i]);
+    ch.series.forEach(function (s, j) {
+      cells += '<c r="' + colLetter(j + 1) + (i + 2) + '"><v>' + fmtNum(s[1][i]) + "</v></c>";
+    });
+    rows.push('<row r="' + (i + 2) + '">' + cells + "</row>");
+  }
+  const main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const pkg = "http://schemas.openxmlformats.org/package/2006/relationships";
+  const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  const files = [
+    ["[Content_Types].xml", xml +
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+      '<Default Extension="xml" ContentType="application/xml"/>' +
+      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+      '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+      "</Types>"],
+    ["_rels/.rels", xml + '<Relationships xmlns="' + pkg + '"><Relationship Id="rId1" ' +
+      'Type="' + rel + '/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+    ["xl/workbook.xml", xml + '<workbook xmlns="' + main + '" xmlns:r="' + rel + '"><sheets>' +
+      '<sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'],
+    ["xl/_rels/workbook.xml.rels", xml + '<Relationships xmlns="' + pkg + '">' +
+      '<Relationship Id="rId1" Type="' + rel + '/worksheet" Target="worksheets/sheet1.xml"/>' +
+      "</Relationships>"],
+    ["xl/worksheets/sheet1.xml", xml + '<worksheet xmlns="' + main + '"><sheetData>' + rows.join("") +
+      "</sheetData></worksheet>"],
+  ];
+  const z = new JSZip();
+  const when = new Date(Date.UTC(1980, 0, 1, 0, 0, 0));
+  for (const f of files) z.file(f[0], f[1], { date: when });
+  return z.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+
+// Colour of the master's level-1 body text as an <a:solidFill> element, or ""
+// when the master declares none (engine.py:body_color).
+function bodyColor(geo) {
+  const x = geo[MASTER];
+  if (x === undefined) return "";
+  const i = x.indexOf("<p:bodyStyle>");
+  const j = i !== -1 ? x.indexOf("<a:lvl1pPr", i) : -1;
+  if (j === -1) return "";
+  const d = /<a:defRPr\b[^>]*>([\s\S]*?)<\/a:defRPr>/.exec(x.slice(j, x.indexOf("</a:lvl1pPr>", j)));
+  const f = d ? /<a:solidFill>[\s\S]*?<\/a:solidFill>/.exec(d[1]) : null;
+  return f ? f[0] : "";
+}
+
+// Typeface of the master's level-1 body text, or null.
+function bodyFont(geo) {
+  const x = geo[MASTER];
+  if (x === undefined) return null;
+  const i = x.indexOf("<p:bodyStyle>");
+  const j = i !== -1 ? x.indexOf("<a:lvl1pPr", i) : -1;
+  const m = j !== -1 ? /<a:latin typeface="([^"]+)"/.exec(x.slice(j, x.indexOf("</a:lvl1pPr>", j))) : null;
+  return m && m[1].charAt(0) !== "+" ? m[1] : null;
+}
+
+// ---- slide surgery (engine.py: remove_sp, add_body_clone) ----
+// Drop the <p:sp> containing `marker` (an empty body placeholder; an
+// <p:txBody> with no <a:p> is not valid).
+function removeSp(xml, marker) {
+  const block = spBlock(xml, marker);
+  return xml.replace(block, function () { return ""; });
+}
+
+// Insert after the body shape containing `marker` a copy of it for the
+// placeholder `newTag`, with its own shape id and without the creationId
+// extension (which must be unique).
+function addBodyClone(xml, marker, newTag) {
+  const block = spBlock(xml, marker);
+  let clone = block.replace(marker, function () { return newTag; });
+  clone = clone.replace(/(<p:cNvPr id=")[0-9]+(")/, function (m, a, b) {
+    return a + String(nextShapeId(xml)) + b;
+  });
+  clone = clone.replace(/(<p:cNvPr [^>]*>)<a:extLst>[\s\S]*?<\/a:extLst>(<\/p:cNvPr>)/, "$1$2");
+  clone = clone.replace(/(<p:cNvPr id="[0-9]+" name=")([^"]*)(")/, "$1$2 (2)$3");
+  return xml.replace(block, function () { return block + clone; });
+}
+
+// Give the slide placeholder `tag` its layout placeholder's geometry and list
+// style as its own: an explicit <a:xfrm> from `box` and a copy of the layout
+// block's <a:lstStyle>. A placeholder with a sentinel idx is linked to
+// nothing, so it inherits neither (engine.py:stamp_orphan).
+function stampOrphan(xml, tag, box, block) {
+  const sp = spBlock(xml, tag);
+  let nw = sp.replace("<p:spPr/>", function () {
+    return '<p:spPr><a:xfrm><a:off x="' + box[0] + '" y="' + box[1] + '"/><a:ext cx="' + box[2] +
+      '" cy="' + box[3] + '"/></a:xfrm></p:spPr>';
+  });
+  const lst = /<a:lstStyle>[\s\S]*?<\/a:lstStyle>/.exec(block || "");
+  if (lst) nw = nw.replace("<a:lstStyle/>", function () { return lst[0]; });
+  return xml.replace(sp, function () { return nw; });
+}
+
+// ---- package slots (engine.py: unesc, package_slots, plan_title_text) ----
+// Text of an XML text node with its character references resolved.
+function unesc(text) {
+  return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+}
+
+// Where the template's four slides sit in presentation.xml and where the
+// clones may go: { slots: {slide file: [sldId id, rId]} for slide1..slide4,
+// nextSid, nextRid (numbers), nextFile }. Everything is read from the
+// template, so a template with its own ids and relationships (or more parts)
+// is cloned without collisions.
+function packageSlots(names, pres, presRels) {
+  const slots = {};
+  for (let n = 1; n <= 4; n++) {
+    const fn = "ppt/slides/slide" + n + ".xml";
+    const rel = new RegExp('<Relationship\\b[^>]*Target="slides/slide' + n + '\\.xml"[^>]*>').exec(presRels);
+    const rid = rel ? /\bId="([^"]+)"/.exec(rel[0]) : null;
+    const sld = rid ? new RegExp('<p:sldId\\b[^>]*\\br:id="' + rid[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+      '"[^>]*>').exec(pres) : null;
+    const sid = sld ? /\bid="([0-9]+)"/.exec(sld[0]) : null;
+    if (!sid) {
+      throw new Error("template slide" + n + ".xml is not listed in presentation.xml (the first " +
+        "four slides must be title, plan, content, closing)");
+    }
+    slots[fn] = [parseInt(sid[1], 10), rid[1]];
+  }
+  const sids = (pres.match(/<p:sldId\b[^>]*\bid="[0-9]+"/g) || []).map(function (m) {
+    return parseInt(/\bid="([0-9]+)"/.exec(m)[1], 10);
+  });
+  const rids = (presRels.match(/\bId="rId[0-9]+"/g) || []).map(function (m) {
+    return parseInt(/([0-9]+)/.exec(m)[1], 10);
+  });
+  const files = [];
+  for (const nm of names) {
+    const m = /^ppt\/slides\/slide([0-9]+)\.xml$/.exec(nm);
+    if (m) files.push(parseInt(m[1], 10));
+  }
+  return { slots: slots, nextSid: Math.max.apply(null, sids.concat([255])) + 1,
+    nextRid: Math.max.apply(null, rids.concat([0])) + 1,
+    nextFile: Math.max.apply(null, files.concat([4])) + 1 };
+}
+
+// The plan slide's title as the template has it, minus a trailing
+// parenthesised remark (a template hint such as "Plan (if any)").
+function planTitleText(planXml) {
+  const block = spBlock(planXml, TITLE_MARKER) || "";
+  const text = unesc((block.match(/<a:t>([^<]*)<\/a:t>/g) || []).map(function (t) {
+    return t.slice(5, -6);
+  }).join("")).trim();
+  return text.replace(/\s*\([^()]*\)\s*$/, "").trim() || "Plan";
+}
+
+// ---- slide parsing (engine.py: parse_column, parse_slide) ----
+const BLOCK_RE = /^:::\s*(left|right)\s*$/i;
+const LAYOUT_RE = /^layout:\s*(.+)$/i;
+
+// Items of one column: [level, runs, num] text items, ["table", table] and
+// ["chart", chart]. An options line `{...}` applies to the pipe table that
+// follows it and is an error anywhere else.
+function parseColumn(lines) {
+  const parsed = [];
+  let pending = null;
+  let j = 0;
+  while (j < lines.length) {
+    const s = lines[j].trim();
+    if (!s) { j += 1; continue; }
+    if (isOptionsLine(s)) {
+      if (pending !== null) throw new Error("two options lines in a row ('" + s + "')");
+      pending = parseOptions(s);
+      j += 1;
+      continue;
+    }
+    if (s.startsWith("|")) {
+      const rows = [];
+      while (j < lines.length && lines[j].trim().startsWith("|")) {
+        rows.push(lines[j]);
+        j += 1;
+      }
+      if (pending !== null && "chart" in pending) parsed.push(["chart", parseChart(rows, pending)]);
+      else parsed.push(["table", parseTable(rows, pending)]);
+      pending = null;
+      continue;
+    }
+    if (pending !== null) {
+      throw new Error("an options line must be followed by a pipe table, got '" + s + "'");
+    }
+    const nm = parseNumbered(s);
+    if (s.startsWith("- ")) parsed.push([1, parseInline(s.slice(2)), null]);
+    else if (nm) {
+      // the as-written number is replaced by its run mark below
+      parsed.push([1, parseInline(nm[2]), [nm[0], nm[1]]]);
+    } else parsed.push([0, parseInline(s), null]);
+    j += 1;
+  }
+  if (pending !== null) throw new Error("an options line must be followed by a pipe table");
+  numberSlideItems(parsed);
+  return parsed;
+}
+
+// [title, columns, layout] of one `# slide` section. `columns` holds one item
+// list, or two when the section has `::: left` and `::: right` blocks (a
+// block ends at `:::`, at the next block or at the end of the section);
+// `layout` is the `layout: <name>` line or null.
+function parseSlide(body) {
+  let title = null, layout = null, inside = false;
+  const top = [], blocks = [];
+  for (const b of body) {
+    if (b.startsWith("## ")) { title = b.slice(3).trim(); continue; }
+    const s = b.trim();
+    const m = BLOCK_RE.exec(s);
+    if (m) {
+      blocks.push([m[1].toLowerCase(), []]);
+      inside = true;
+    } else if (s === ":::") {
+      inside = false;
+    } else if (!inside && LAYOUT_RE.test(s)) {
+      layout = LAYOUT_RE.exec(s)[1].trim();
+    } else {
+      (inside ? blocks[blocks.length - 1][1] : top).push(b);
+    }
+  }
+  if (!blocks.length) return [title, [parseColumn(top)], layout];
+  if (top.some(function (t) { return t.trim(); })) {
+    throw new Error("slide '" + title + "' has text outside its ::: left / ::: right blocks");
+  }
+  if (blocks.length !== 2 || blocks[0][0] !== "left" || blocks[1][0] !== "right") {
+    throw new Error("slide '" + title + "' needs exactly one ::: left block followed by one ::: right block");
+  }
+  return [title, blocks.map(function (bl) { return parseColumn(bl[1]); }), layout];
 }
 
 // One past the largest <p:cNvPr id=".."> in a slide — shape ids must be
@@ -1083,7 +2121,7 @@ function parseMd(text) {
   const lines = text.split(/\r?\n/);
   const n = lines.length;
   let i = 0;
-  let bodySize = 18;
+  let bodySize = null;
   let lang = null;
   if (n && lines[0].trim() === "---") {
     i = 1;
@@ -1098,7 +2136,7 @@ function parseMd(text) {
     }
     if (i < n) i++;
     const bs = parseInt(fm["body_size"], 10);
-    bodySize = isNaN(bs) ? 18 : bs;
+    bodySize = ("body_size" in fm) && !isNaN(bs) ? bs : null;
     const langIn = (fm["lang"] || "").trim();
     if (langIn) {
       if (!/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/.test(langIn)) {
@@ -1108,10 +2146,12 @@ function parseMd(text) {
       lang = langIn;
     }
   }
-  // bodySize now only drives the plan slide: items render at bodySize - 1.
-  // Body text takes its size from the template (resolveBodySize).
-  // `lang`, when declared, is stamped on every generated run and end mark.
-  const TOC = bodySize - 1;
+  // bodySize drives the plan slide (items at bodySize - 1), the table cells
+  // (also bodySize - 1: a table has no placeholder to inherit a size from) and
+  // the default chart text size. Body text takes its size from the template
+  // (resolveBodySize) and stamps no size of its own. `lang`, when declared, is
+  // stamped on every generated run and end mark.
+  const TOC = bodySize ? bodySize - 1 : null;
 
   const sections = [];
   let cur = null;
@@ -1127,47 +2167,27 @@ function parseMd(text) {
   if (cur) sections.push(cur);
 
   const doc = { bodySize: bodySize, TOC: TOC, tablePt: TOC, lang: lang,
-    title: null, plan: null, slides: [], closing: null };
+    title: null, plan: null, planTitle: null, slides: [], closing: null };
   for (const sec of sections) {
     const header = sec[0], body = sec[1];
     if (header === "title") {
       doc.title = body.filter(function (b) { return b.trim(); }).map(function (b) { return b.trim(); }).join(" ").trim();
     } else if (header === "plan") {
-      doc.plan = body.filter(function (b) { return b.trim(); }).map(function (b) { return b.trim(); });
+      const texts = [], raw = [];
+      for (const b of body) {
+        const line = b.trim();
+        if (!line) continue;
+        if (line.startsWith("## ")) { doc.planTitle = line.slice(3).trim(); continue; }
+        const nm = parseNumbered(line);
+        texts.push(nm ? nm[2] : line);
+        raw.push(nm ? [nm[0], nm[1]] : null);
+      }
+      const marks = groupNumbering(raw);
+      doc.plan = texts.map(function (t, k) { return [t, marks[k]]; });
     } else if (header === "closing") {
       doc.closing = body.filter(function (b) { return b.trim(); }).map(function (b) { return b.trim(); }).join(" ").trim();
     } else if (header === "slide") {
-      let stitle = null;
-      const parsed = [];
-      let j = 0;
-      while (j < body.length) {
-        const b = body[j];
-        if (b.startsWith("## ")) {
-          stitle = b.slice(3).trim();
-          j += 1;
-          continue;
-        }
-        const s = b.trim();
-        if (!s) { j += 1; continue; }
-        if (s.startsWith("|")) {
-          // a run of consecutive "|" lines is one pipe table
-          const rows = [];
-          while (j < body.length && body[j].trim() && body[j].trim().startsWith("|")) {
-            rows.push(body[j]);
-            j += 1;
-          }
-          parsed.push(["table", parseTable(rows)]);
-          continue;
-        }
-        if (s.startsWith("- ")) parsed.push([1, parseInline(s.slice(2))]);
-        else if (/^\d+\.\s/.test(s)) {
-          // numbered list item: rendered as a level-1 bullet, keeping the
-          // number in the text (like the plan slide)
-          parsed.push([1, parseInline(s)]);
-        } else parsed.push([0, parseInline(s)]);
-        j += 1;
-      }
-      doc.slides.push([stitle, parsed]);
+      doc.slides.push(parseSlide(body));
     }
   }
   return doc;
@@ -1186,13 +2206,30 @@ async function buildZip(templateBuffer, doc) {
   const contentXml = await getXml(CONTENT_SLIDE);
   const contentRels = await getXml(CONTENT_RELS);
   const bodyPt = await resolveBodySize(zip, contentXml);
+  if (doc.bodySize === null) {
+    doc.bodySize = bodyPt;
+    doc.TOC = doc.tablePt = bodyPt - 1;
+  }
+  const pk = packageSlots(Object.keys(zip.files), pres, presRels);
+
+  // Where each slide's columns go (layout file, placeholder tags, boxes).
+  // Resolved before anything is written so a bad layout fails early.
+  const geo = await loadGeometryParts(zip);
+  const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
+  const dflt = defaultBody(geo, contentXml, contentRels);
+  const plans = doc.slides.map(function (sl) {
+    return planSlide(geo, dflt, bodyPt, sl[2], sl[1].length);
+  });
+  doc.geom = plans.map(function (pl) {
+    return pl.phs.map(function (ph) { return [ph.box, ph.pt, ph.spacing]; });
+  });
 
   // 1) clone the content slide (n-1 clones -> slide5 .. slide(n+3))
   const clones = [];
   for (let i = 1; i < n; i++) {
-    const fn = "ppt/slides/slide" + (4 + i) + ".xml";
-    const rid = "rId" + (RID_BASE + i - 1);
-    const sid = SLIDE_ID_BASE + i - 1;
+    const fn = "ppt/slides/slide" + (pk.nextFile + i - 1) + ".xml";
+    const rid = "rId" + (pk.nextRid + i - 1);
+    const sid = pk.nextSid + i - 1;
     clones.push([fn, sid, rid]);
     zip.file(fn, contentXml);
     zip.file(relsName(fn), contentRels);
@@ -1211,11 +2248,14 @@ async function buildZip(templateBuffer, doc) {
   if (relAdd) presRels = presRels.replace("</Relationships>", relAdd + "</Relationships>");
 
   // 3) rebuild sldIdLst: title, plan?, content..., closing? (closing last)
-  const sldids = ['<p:sldId id="270" r:id="rId2"/>'];
-  if (doc.plan !== null) sldids.push('<p:sldId id="273" r:id="rId3"/>');
-  sldids.push('<p:sldId id="271" r:id="rId4"/>');
+  const sld = function (fn) {
+    return '<p:sldId id="' + pk.slots[fn][0] + '" r:id="' + pk.slots[fn][1] + '"/>';
+  };
+  const sldids = [sld(TITLE_SLIDE)];
+  if (doc.plan !== null) sldids.push(sld(PLAN_SLIDE));
+  sldids.push(sld(CONTENT_SLIDE));
   for (const c of clones) sldids.push('<p:sldId id="' + c[1] + '" r:id="' + c[2] + '"/>');
-  if (doc.closing !== null) sldids.push('<p:sldId id="272" r:id="rId5"/>');
+  if (doc.closing !== null) sldids.push(sld(CLOSE_SLIDE));
   pres = pres.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, "<p:sldIdLst>" + sldids.join("") + "</p:sldIdLst>");
 
   // 4) title slide (topic line; bold, size inherited from the template;
@@ -1237,44 +2277,119 @@ async function buildZip(templateBuffer, doc) {
   if (doc.plan !== null) {
     let planXml = await getXml(PLAN_SLIDE);
     const planTitleBase = firstRpr(planXml, TITLE_MARKER);
-    planXml = setBlockParas(planXml, TITLE_MARKER, titlePara("План", null, planTitleBase, doc.lang));
+    doc.planTitleShown = doc.planTitle || planTitleText(planXml);
+    planXml = setBlockParas(planXml, TITLE_MARKER, titlePara(doc.planTitleShown, null, planTitleBase, doc.lang));
     const planBodyBase = firstRpr(planXml, BODY_MARKER);
-    planXml = setBlockParas(planXml, BODY_MARKER, doc.plan.map(function (t) { return tocPara(t, doc.TOC, planBodyBase, doc.lang); }).join(""));
+    const planFix = listFixes(layoutBodyBlock(geo, await getXml(relsName(PLAN_SLIDE)), 1), masterXml);
+    planXml = setBlockParas(planXml, BODY_MARKER, doc.plan.map(function (t) {
+      return tocPara(t[0], doc.TOC, planBodyBase, doc.lang, t[1], t[1] ? planFix.num[0] : ["", ""]);
+    }).join(""));
     zip.file(PLAN_SLIDE, planXml);
   }
 
-  // 6) content slides (slide3 + clones, in order); body runs inherit the
+  // 6) content slides (slide3 + clones, in order). Body runs inherit the
   //    template body font (no sz stamped); the original runs' typeface/lang
-  //    are kept via firstRpr; a pipe table becomes a <p:graphicFrame> shape
-  //    below the slide's text, its cells stamped at body_size - 1 (a table
-  //    has no placeholder to inherit a size from)
+  //    are kept via firstRpr. Each column fills its own body placeholder
+  //    (dropped when the column has no text); its tables and charts become
+  //    <p:graphicFrame> shapes below the text, table cells at the size
+  //    columnFlow chose, charts wired to a chart part, its embedded workbook
+  //    and a slide relationship.
   const contentOrder = [CONTENT_SLIDE].concat(clones.map(function (c) { return c[0]; }));
   let tableStylesXml = "";
   if (zip.file("ppt/tableStyles.xml")) {
     tableStylesXml = await zip.file("ppt/tableStyles.xml").async("string");
   }
-  const styleId = tableStyleId(tableStylesXml);
+  const styleDefault = tableStyleId(tableStylesXml);
+  const font = bodyFont(geo);
+  const color = bodyColor(geo);
+  const layouts = [];
+  let chartNo = 0, ctExtra = "";
   for (let k = 0; k < contentOrder.length; k++) {
-    const stitle = doc.slides[k][0];
-    const parsed = doc.slides[k][1];
-    let x = await getXml(contentOrder[k]);
+    const stitle = doc.slides[k][0], columns = doc.slides[k][1], plan = plans[k];
+    let x = contentXml;
+    const phs = plan.phs;
+    let rels = contentRels;
+    if (plan.file) {
+      x = x.replace(BODY_MARKER, function () { return phs[0].tag; });
+      if (phs.length === 2) x = addBodyClone(x, phs[0].tag, phs[1].tag);
+      for (const ph of phs) {
+        if (ph.orphan) x = stampOrphan(x, ph.tag, ph.box, ph.block);
+      }
+      rels = rels.replace(/Target="\.\.\/slideLayouts\/slideLayout[0-9]+\.xml"/, function () {
+        return 'Target="../slideLayouts/' + plan.file.split("/").pop() + '"';
+      });
+    }
     const ctBase = firstRpr(x, TITLE_MARKER);
     x = setBlockParas(x, TITLE_MARKER, titlePara(stitle || "", null, ctBase, doc.lang));
-    const cbBase = firstRpr(x, BODY_MARKER);
-    x = setBlockParas(x, BODY_MARKER, parsed.filter(function (p) {
-      return p[0] !== "table";
-    }).map(function (p) { return para(p[0], p[1], cbBase, doc.lang); }).join(""));
-    const lay = slideLayout(parsed, bodyPt, doc.tablePt);
-    if (lay.tables.length) {
-      const nid = nextShapeId(x);
-      const frames = [];
-      for (let t = 0; t < lay.tables.length; t++) {
-        frames.push(tableFrameXml(lay.tables[t][0], lay.tables[t][1], styleId,
-          doc.tablePt, cbBase, doc.lang, nid + t, t + 1));
+    const flows = [], bases = [], slideLayouts = [];
+    columns.forEach(function (items, ci) {
+      const ph = phs[ci];
+      const flow = columnFlow(items, ph.box, ph.pt, doc.tablePt, ph.spacing);
+      flows.push(flow);
+      slideLayouts.push({ box: ph.box, pt: ph.pt, flow: flow });
+      const base = firstRpr(x, ph.tag);
+      bases.push(base);
+      const fix = listFixes(ph.block, masterXml);
+      const addFor = function (it) {
+        if (it[2]) return fix.num[it[0]];
+        return it[0] === 1 ? fix.bullet : fix.plain;
+      };
+      const text = items.filter(function (it) { return typeof it[0] === "number"; })
+        .map(function (it) { return para(it[0], it[1], base, doc.lang, it[2], addFor(it)); }).join("");
+      x = text ? setBlockParas(x, ph.tag, text) : removeSp(x, ph.tag);
+    });
+    layouts.push(slideLayouts);
+    let nid = nextShapeId(x);
+    const ridNums = (rels.match(/Id="rId([0-9]+)"/g) || []).map(function (m) {
+      return parseInt(/([0-9]+)/.exec(m)[1], 10);
+    });
+    let ridNo = 1 + Math.max.apply(null, [0].concat(ridNums));
+    const frames = [];
+    let tno = 0, cno = 0, relAdd = "";
+    for (let fi = 0; fi < flows.length; fi++) {
+      for (const fr of flows[fi].frames) {
+        const kind = fr[0], obj = fr[1], geom = fr[2];
+        if (kind === "table") {
+          tno += 1;
+          // a style without fills leaves the text colour to the slide, which
+          // for a table is not the body text's
+          frames.push(tableFrameXml(obj, geom, TABLE_STYLES[obj.style] || styleDefault,
+            geom.pt, bases[fi], doc.lang, nid, tno, TABLE_STYLES[obj.style] ? color : ""));
+        } else {
+          chartNo += 1;
+          cno += 1;
+          const rid = "rId" + ridNo;
+          ridNo += 1;
+          const cpt = obj.pt || Math.max(TABLE_MIN_PT, doc.tablePt - CHART_PT_BELOW_TABLE);
+          const name = "chart" + chartNo + ".xml";
+          const book = "Microsoft_Excel_Sheet" + chartNo + ".xlsx";
+          zip.file("ppt/charts/" + name, chartXml(obj, cpt, doc.lang, font, color));
+          zip.file("ppt/charts/_rels/" + name + ".rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" ' +
+            'Target="../embeddings/' + book + '"/></Relationships>');
+          zip.file("ppt/embeddings/" + book, await workbookBytes(obj));
+          ctExtra += '<Override PartName="/ppt/charts/' + name + '" ContentType=' +
+            '"application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>';
+          relAdd += '<Relationship Id="' + rid + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" ' +
+            'Target="../charts/' + name + '"/>';
+          frames.push(chartFrameXml(geom, rid, nid, cno));
+        }
+        nid += 1;
       }
-      x = insertGraphicFrames(x, frames);
     }
+    if (frames.length) x = insertGraphicFrames(x, frames);
+    if (relAdd) rels = rels.replace("</Relationships>", function () { return relAdd + "</Relationships>"; });
     zip.file(contentOrder[k], x);
+    zip.file(relsName(contentOrder[k]), rels);
+  }
+  if (chartNo) {
+    if (ct.indexOf('Extension="xlsx"') < 0) {
+      ctExtra = '<Default Extension="xlsx" ContentType="application/' +
+        'vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>' + ctExtra;
+    }
+    ct = ct.replace("</Types>", function () { return ctExtra + "</Types>"; });
   }
 
   // 7) closing slide (title stamped at the template's declared size)
@@ -1296,46 +2411,76 @@ async function buildZip(templateBuffer, doc) {
   for (const name of Object.keys(zip.files)) {
     if (zip.files[name] && zip.files[name].dir) delete zip.files[name];
   }
-  return { zip: zip, bodyPt: bodyPt };
+  setSlideSize(pres);
+  return { zip: zip, bodyPt: bodyPt, layouts: layouts, slideSize: [SLIDE_W, SLIDE_H] };
 }
 
-// Ordered list of slide specs for the PDF preview (pure data). `tables` carries
-// the parsed table with its layout geometry so the preview can draw it where
-// the engine put it.
-function slideSpecs(doc, bodyPt) {
+// The slide master and every layout as name -> XML text: the parts the
+// geometry resolvers (planSlide and friends) read synchronously.
+async function loadGeometryParts(zip) {
+  const geo = {};
+  for (const name of Object.keys(zip.files)) {
+    if (name === MASTER || /^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/.test(name)) {
+      geo[name] = await zip.file(name).async("string");
+    }
+  }
+  return geo;
+}
+
+// Ordered list of slide specs for the PDF preview (pure data). A content
+// slide carries one entry per column: its items, the box and text size
+// buildZip resolved from the template, and the flow (table and chart
+// geometry) the engine used, so the preview draws things where the engine put
+// them. Without `layouts` (no template read) a slide is one column in
+// DEFAULT_BOX.
+function slideSpecs(doc, bodyPt, layouts) {
   const specs = [];
   specs.push({ kind: "title", topic: doc.title || "" });
-  if (doc.plan) specs.push({ kind: "plan", title: "План", items: doc.plan, toc: doc.TOC });
-  for (const s of doc.slides) {
-    const lay = slideLayout(s[1], bodyPt, doc.tablePt);
-    specs.push({ kind: "content", title: s[0], body: s[1], bodyPt: bodyPt,
-      tables: lay.tables, tablePt: doc.tablePt });
-  }
+  if (doc.plan) specs.push({ kind: "plan", title: doc.planTitleShown || doc.planTitle || "Plan",
+    items: doc.plan, toc: doc.TOC });
+  doc.slides.forEach(function (s, k) {
+    const columns = s[1].map(function (items, ci) {
+      const lay = layouts && layouts[k] ? layouts[k][ci] :
+        { box: DEFAULT_BOX, pt: bodyPt, flow: columnFlow(items, DEFAULT_BOX, bodyPt, doc.tablePt) };
+      return { items: items, box: lay.box, pt: lay.pt, flow: lay.flow };
+    });
+    specs.push({ kind: "content", title: s[0], columns: columns, bodyPt: bodyPt,
+      tablePt: doc.tablePt });
+  });
   if (doc.closing) specs.push({ kind: "closing", title: doc.closing });
   return specs;
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    EMU_PER_INCH: EMU_PER_INCH, SLIDE_W: SLIDE_W, SLIDE_H: SLIDE_H,
+    EMU_PER_INCH: EMU_PER_INCH, setSlideSize: setSlideSize, getSlideSize: function () { return [SLIDE_W, SLIDE_H]; },
     TITLE_MARKER: TITLE_MARKER, BODY_MARKER: BODY_MARKER,
-    TITLE_ANCHOR: TITLE_ANCHOR, TITLE_ANCHOR_RU: TITLE_ANCHOR_RU,
+    TITLE_ANCHOR_RU: TITLE_ANCHOR_RU,
     TITLE_ANCHOR_EN: TITLE_ANCHOR_EN, topicAnchor: topicAnchor,
     CONTENT_SLIDE: CONTENT_SLIDE, CONTENT_RELS: CONTENT_RELS,
     TITLE_SLIDE: TITLE_SLIDE, PLAN_SLIDE: PLAN_SLIDE, CLOSE_SLIDE: CLOSE_SLIDE,
-    SLIDE_ID_BASE: SLIDE_ID_BASE, RID_BASE: RID_BASE, TITLE_PT: TITLE_PT,
+    TITLE_PT: TITLE_PT,
     CONTENT_TITLE_OFF: CONTENT_TITLE_OFF, CONTENT_BODY_OFF: CONTENT_BODY_OFF,
-    esc: esc, parseInline: parseInline, parseTable: parseTable, para: para, titlePara: titlePara, tocPara: tocPara,
+    esc: esc, parseInline: parseInline, parseTable: parseTable, para: para,
+    parseNumbered: parseNumbered, groupNumbering: groupNumbering,
+    numberSlideItems: numberSlideItems, numberLabels: numberLabels,
+    paraProps: paraProps, titlePara: titlePara, tocPara: tocPara,
     RPR_RE: RPR_RE, firstRpr: firstRpr, bareRpr: bareRpr, mergeRpr: mergeRpr,
     placeholderSz: placeholderSz, resolveBodySize: resolveBodySize,
     setBlockParas: setBlockParas, replacePara: replacePara, relsName: relsName,
     endParaRpr: endParaRpr,
     charsPerLine: charsPerLine, estLines: estLines, lineEmu: lineEmu, runsText: runsText,
-    tableGeom: tableGeom, slideLayout: slideLayout, cellPara: cellPara, cellXml: cellXml,
+    tableGeom: tableGeom, columnFlow: columnFlow, cellPara: cellPara, cellXml: cellXml,
     tableFrameXml: tableFrameXml, nextShapeId: nextShapeId,
     insertGraphicFrames: insertGraphicFrames, tableStyleId: tableStyleId,
-    BODY_W: BODY_W, BODY_H: BODY_H, BODY_W_IN: BODY_W_IN, BODY_H_IN: BODY_H_IN,
-    BODY_OFF_X: BODY_OFF_X, BODY_OFF_Y: BODY_OFF_Y,
+    DEFAULT_BOX: DEFAULT_BOX, TABLE_MIN_PT: TABLE_MIN_PT, TABLE_STYLES: TABLE_STYLES,
+    CHART_MIN_H: CHART_MIN_H, parseOptions: parseOptions, parseNumber: parseNumber,
+    tableSpans: tableSpans, parseChart: parseChart, parseSlide: parseSlide,
+    spBox: spBox, bodyPhs: bodyPhs, planSlide: planSlide, layoutCatalog: layoutCatalog,
+    isTwoContent: isTwoContent, masterBodyBox: masterBodyBox,
+    listFixes: listFixes, effectiveSpacing: effectiveSpacing, packageSlots: packageSlots,
+    planTitleText: planTitleText, defaultBody: defaultBody,
+    chartXml: chartXml, workbookBytes: workbookBytes, loadGeometryParts: loadGeometryParts,
     AVG_CHAR_EM: AVG_CHAR_EM, LINE_SPACING: LINE_SPACING,
     TABLE_URI: TABLE_URI, TABLE_STYLE_DEFAULT: TABLE_STYLE_DEFAULT,
     TABLE_GAP: TABLE_GAP, TABLE_CELL_PAD: TABLE_CELL_PAD,
@@ -1390,20 +2535,26 @@ if (typeof module !== "undefined" && module.exports) {
   // topic in the chat message.
   const PROMPT_TEXT =
     "FORMAT RULES\n" +
-    "- Front matter (optional): body_size: <pt> — baseline for plan items, which render at body_size - 1 pt. Body text inherits the template font. lang: <BCP-47> (e.g. ru-RU) — stamps the proofing language on all generated text so PowerPoint does not flag it as misspelled.\n" +
+    "- Front matter (optional): body_size: <pt> — baseline for plan items and table cells, which render at body_size - 1 pt; leave it out to use the template\'s own body size. Body text inherits the template font. lang: <BCP-47> (e.g. ru-RU) — stamps the proofing language on all generated text so PowerPoint does not flag it as misspelled.\n" +
     "- Sections, in presentation order: exactly one \"# title\"; at most one \"# plan\"; one or more \"# slide\"; at most one \"# closing\".\n" +
     "- # title: the topic text only (one line below the # title).\n" +
     "\n" +
     "# title\n" +
     "<Presentation topic>\n" +
     "\n" +
-    "- # plan: a numbered list, one item per line: 1., 2., 3.\n" +
-    "- # slide: ## <text> is the slide title. Body lines: a plain line (column 0) = level 0 (no bullet); \"- \" = level 1 bullet; \"1. <text>\" = level 1 bullet with the number kept in the text.\n" +
+    "- # plan: a numbered list, one item per line: 1., 2., 3. (PowerPoint numbering). Its title is the template\'s own plan title; an optional \"## <title>\" line overrides it.\n" +
+    "- # slide: ## <text> is the slide title. Body lines: a plain line (column 0) = level 0 (no bullet); \"- \" = level 1 bullet; \"1. <text>\" (or \"1) <text>\") = level 1 numbered item, a PowerPoint numbered list: write the number, the engine does not store it in the text. Consecutive numbered lines form one list; a bullet, a plain line or a change between \".\" and \")\" ends it; the first number is where the list starts.\n" +
     "- Inline marks: **bold** = bold run; *single asterisks* = italic run; ++plus signs++ = underlined run. A marker must sit at a word boundary; a lone * or _ inside a word stays literal.\n" +
-    "- Pipe tables: a run of lines each starting with \"|\" is one table. The second line is the separator (| --- | :--: | ---: |) and sets column alignment (left, center, right); the first line is the head row, the rest are body rows. One table = one <a:tbl>; it is placed below the slide's text and its cells render at body_size - 1 pt.\n\n" +
+    "- Pipe tables: a run of lines each starting with \"|\" is one table. The second line is the separator (| --- | :--: | ---: |) and sets column alignment (left, center, right); the first line is the head row, the rest are body rows. One table = one <a:tbl>; it is placed below the slide's text and its cells render at body_size - 1 pt (a table that would overflow shrinks, down to 10 pt).\n" +
+    "- Table options: a line {key: value; key: value} directly above the table. widths: 3,1,1 (relative column widths, one whole number per column); size: 14 (cell pt; a fixed size does not shrink); header: off; first-col: on; banded: off; style: default|plain|grid. A cell that is exactly << merges into the cell to its left, ^^ into the cell above.\n" +
+    "- Charts: an options line with chart: above a pipe table makes it a native chart: {chart: column|bar|line|pie; title: <text>; legend: top|bottom|left|right|off; labels: on; stacked: on; size: 12; height: 3.5}. First column = categories, head row = series names, every other cell a number (a comma is a decimal comma). Without height the chart fills the space left under the slide's text.\n" +
+    "- Columns: \"::: left\" ... \"::: right\" ... \":::\" blocks (one of each, in that order; only the ## title may sit outside them) give a slide two columns, e.g. text beside a table or chart. \"layout: <name>\" selects another template layout by name.\n" +
+    "\n" +
     "DECK QUALITY RULES\n" +
     "- Use only the slide types above.\n" +
     "- Plan items: a numbered list, not bullets.\n" +
+    "- Do not overuse bullet points: keep \"- \" for genuinely parallel items; prefer a short plain line for a single point, a numbered list for a genuine sequence or ranking, and a table for structured data.\n" +
+    "- Use a chart when the point is a trend, a ranking or a share of a whole; a table when the exact values matter.\n" +
     "- Bold key labels with **bold**.\n" +
     "- Citations: cite a statute/article by number AND by the point that enumerates points (e.g. \u0447. 1 \u0441\u0442. 56 \u0423\u041A \u0420\u0424, \u043f. 2 \u0441\u0442. 401 \u0413\u041A \u0420\u0424, U.S. Const. art. I, para. 8); never a bare article when a specific part is meant. If a bare article enumerates points, add point numbers (no. N / \u0447. N).\n" +
     "- No hyperlinks: drop URLs from the source content; fold references into the body text (only use links if explicitly tasked to).\n" +
@@ -1509,7 +2660,7 @@ if (typeof module !== "undefined" && module.exports) {
         } catch (e) {
           log("Template scene parse failed (" + e.message + ") — plain preview.");
         }
-        await makePreview(doc, bodyPt, scenes);
+        await makePreview(doc, bodyPt, scenes, built.layouts);
       }
     } catch (e) {
       log("ERROR: " + (e && e.message ? e.message : String(e)));
@@ -1529,15 +2680,18 @@ if (typeof module !== "undefined" && module.exports) {
   // Draw runs sequentially with per-run bold/italic/underline and word-wrap.
   // Runs are [text, bold, italic, underline, color?, font?] (the engine's run
   // tuples), so the short [text, bold] form still works. Returns next baseline y.
-  function drawRuns(ctx, runs, x, y, maxW, sizePx, level, pxPerInch) {
+  // `label` is the number text of a numbered item ("2.", "3)"); it replaces
+  // the bullet glyph.
+  function drawRuns(ctx, runs, x, y, maxW, sizePx, level, pxPerInch, label) {
     const lineHeight = sizePx * 1.22;
-    const bullet = level === 1;
+    const bullet = level === 1 || !!label;
+    const glyph = label || "•";
     let cx = x, cy = y;
     if (bullet) {
-      // bullet glyph on the first line only; wrapped lines get the indent
+      // marker on the first line only; wrapped lines get the indent
       ctx.font = fontCss(sizePx, false, false);
-      ctx.fillText("•", x, y);
-      cx += ctx.measureText("•  ").width;
+      ctx.fillText(glyph, x, y);
+      cx += ctx.measureText(glyph + "  ").width;
     }
     for (const r of runs) {
       const text = r[0], bold = r[1], italic = r[2] || false, und = r[3] || false;
@@ -1684,14 +2838,14 @@ if (typeof module !== "undefined" && module.exports) {
     const apply = function (el) {
       if (!el) return;
       const sz = el.getAttribute("sz");
-      if (sz) run.szPt = +sz / 100;
+      if (sz) { run.szPt = +sz / 100; run.explicitSz = true; }
       if (el.getAttribute("b") === "1") run.bold = true;
       if (el.getAttribute("i") === "1") run.ital = true;
       if (el.getAttribute("u") === "sng" || el.getAttribute("u") === "dbl") run.u = true;
       const sf = el.getElementsByTagNameNS(A_NS, "solidFill")[0];
-      if (sf) run.color = fillColorOf(sf, null);
+      if (sf) { run.color = fillColorOf(sf, null); run.explicitColor = run.color; }
       const lat = el.getElementsByTagNameNS(A_NS, "latin")[0];
-      if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") run.font = t; }
+      if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") { run.font = t; run.explicitFont = true; } }
     };
     apply(def);
     apply(rPr);
@@ -1705,7 +2859,7 @@ if (typeof module !== "undefined" && module.exports) {
     const sh = { kind: "sp", x: 0, y: 0, w: 0, h: 0, fill: null,
                  ph: null, phKey: null, hasGeom: false,
                  anchor: null, ins: { l: 91440, t: 45720, r: 91440, b: 45720 },
-                 defaultFont: null, paras: [] };
+                 defaultFont: null, defaultSz: null, defaultFillEl: null, paras: [] };
     // Note: p:spPr / p:txBody are in the presentationml namespace; their
     // children (a:xfrm, a:bodyPr, a:p, ...) are in the drawingml namespace.
     const spPr = el.getElementsByTagNameNS(P_NS, "spPr")[0];
@@ -1759,6 +2913,10 @@ if (typeof module !== "undefined" && module.exports) {
         const def = lvl1 ? lvl1.getElementsByTagNameNS(A_NS, "defRPr")[0] : null;
         const lat = def ? def.getElementsByTagNameNS(A_NS, "latin")[0] : null;
         if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") sh.defaultFont = t; }
+        const dsz = def ? def.getAttribute("sz") : null;
+        if (dsz) sh.defaultSz = +dsz / 100;
+        const dsf = def ? def.getElementsByTagNameNS(A_NS, "solidFill")[0] : null;
+        if (dsf) sh.defaultFillEl = dsf;
       }
       for (const p of txBody.getElementsByTagNameNS(A_NS, "p")) {
         const pPr = p.getElementsByTagNameNS(A_NS, "pPr")[0];
@@ -1800,7 +2958,7 @@ if (typeof module !== "undefined" && module.exports) {
       if (ext) { sh.w = +ext.getAttribute("cx"); sh.h = +ext.getAttribute("cy"); }
     }
     const blip = el.getElementsByTagNameNS(A_NS, "blip")[0];
-    if (blip) sh.rId = blip.getAttributeNS(REL_EMBED, "embed");
+    if (blip) sh.rId = blip.getAttributeNS(R_NS, "embed");
     return sh;
   }
 
@@ -1853,6 +3011,8 @@ if (typeof module !== "undefined" && module.exports) {
         const sz = d.getAttribute("sz");
         if (sz) dst.szPt = +sz / 100;
         if (d.getAttribute("b") === "1") dst.bold = true;
+        const sf = d.getElementsByTagNameNS(A_NS, "solidFill")[0];
+        if (sf) dst.fillEl = sf;
         const lat = d.getElementsByTagNameNS(A_NS, "latin")[0];
         if (lat) { const t = lat.getAttribute("typeface"); if (t && t[0] !== "+") dst.font = t; }
       }
@@ -1938,6 +3098,11 @@ if (typeof module !== "undefined" && module.exports) {
     if (!masterXml) throw new Error("template has no slide master");
     const masterRels = await zipText(zip, "ppt/slideMasters/_rels/slideMaster1.xml.rels");
     const master = parseSlideXml(masterXml, fontFallback);
+    // Text colour of the master's title and level-1 body style (a template
+    // may set white text on a dark background; the slide does not say so).
+    for (const st of [master.title, master.body]) {
+      if (st) st.color = (st.fillEl && fillColorOf(st.fillEl, theme)) || null;
+    }
 
     const scenes = [];
     for (let i = 1; i <= 4; i++) {
@@ -1952,12 +3117,16 @@ if (typeof module !== "undefined" && module.exports) {
 
       const scene = {
         idx: i, bg: null, shapes: [],
-        title: master.title || { szPt: 20, bold: true, algn: "ctr", font: null },
-        body: master.body || { szPt: 18, bold: false, algn: "l", font: null },
+        title: Object.assign({}, master.title || { szPt: 20, bold: true, algn: "ctr", font: null }),
+        body: Object.assign({}, master.body || { szPt: 18, bold: false, algn: "l", font: null }),
         bodyLvl0: (master.body && master.body.lvl1) || { marL: 0, indent: 540000, bullet: null },
         bodyLvl1: (master.body && master.body.lvl2) || { marL: 742960, indent: 540000, bullet: "\u2013" },
         fontFallback: fontFallback,
         tablePalette: tablePal,
+        accents: [1, 2, 3, 4, 5, 6].map(function (i) {
+          const hex = theme.colors && theme.colors["accent" + i];
+          return hex ? "#" + hex.toUpperCase() : PREVIEW_ACCENTS[i - 1];
+        }),
       };
 
       // Background: slide, then layout, then master.
@@ -2030,12 +3199,43 @@ if (typeof module !== "undefined" && module.exports) {
       const lBody = phOf(layout, "idx1");
       scene.title.font = (lTitle && lTitle.defaultFont) || scene.title.font || theme.majorFont || fontFallback;
       scene.body.font = (lBody && lBody.defaultFont) || scene.body.font || theme.minorFont || fontFallback;
+      if (lTitle && lTitle.defaultSz) scene.title.szPt = lTitle.defaultSz;
+      if (lTitle && lTitle.defaultFillEl) scene.title.color = fillColorOf(lTitle.defaultFillEl, theme) || scene.title.color;
+      if (lBody && lBody.defaultFillEl) scene.body.color = fillColorOf(lBody.defaultFillEl, theme) || scene.body.color;
+
+      // Text defaults of each placeholder: size, font and colour from the
+      // layout's placeholder, else the master's text style, else the theme.
+      // Runs that state none of their own take them.
+      for (const sh of phs) {
+        const keys = sh.phKey.indexOf("idx") === 0 ? [sh.phKey, "body"] : [sh.phKey];
+        for (const src of [layout, master]) {
+          for (const k of keys) {
+            const c = phOf(src, k);
+            if (!c) continue;
+            if (!sh.defaultSz && c.defaultSz) sh.defaultSz = c.defaultSz;
+            if (!sh.defaultFillEl && c.defaultFillEl) sh.defaultFillEl = c.defaultFillEl;
+            if (!sh.defaultFont && c.defaultFont) sh.defaultFont = c.defaultFont;
+          }
+        }
+        const ms = sh.ph === "title" ? scene.title : scene.body;
+        const sz = sh.defaultSz || (ms && ms.szPt) || 18;
+        const color = (sh.defaultFillEl && fillColorOf(sh.defaultFillEl, theme)) || (ms && ms.color) || null;
+        const font = sh.defaultFont || (ms && ms.font) ||
+          (sh.ph === "title" ? theme.majorFont : theme.minorFont) || fontFallback;
+        for (const para of sh.paras) {
+          for (const run of para.runs) {
+            if (!run.explicitSz) run.szPt = sz;
+            if (!run.explicitColor && color) run.color = color;
+            if (!run.explicitFont) run.font = font;
+          }
+        }
+      }
 
       // Title slide: the shape carrying the topic anchor gets its paragraph
       // replaced by the deck topic when drawing (as the engine does).
       if (i === 1) {
         for (const sh of slide.shapes) {
-          if (sh.ph) continue;
+          if (sh.kind !== "sp") continue;
           const text = sh.paras.map(function (p) {
             return p.runs.map(function (r) { return r.text; }).join("");
           }).join("");
@@ -2079,10 +3279,15 @@ if (typeof module !== "undefined" && module.exports) {
     for (const p of paras) {
       const r0 = p.runs[0] || { szPt: 18, bold: false, font: null };
       const lh = lineH(r0.szPt);
-      const bulletX = boxL + PX(p.marL);
-      // OOXML: `indent` shifts the first line only; wrapped lines sit at marL.
+      // A negative indent hangs the marker left of the text: the marker sits
+      // at marL + indent and every line of text at marL. A non-negative
+      // indent shifts the first line right of marL (the preview draws the
+      // marker at marL and the first line's text indent further on).
+      const hanging = (p.indent || 0) < 0;
+      const bulletX = boxL + PX(p.marL + (hanging ? p.indent : 0));
+      const textL = boxL + PX(p.marL);
       const lineAvail = function (firstLine) {
-        return Math.max(40, avail0 - PX(p.marL) - (firstLine ? PX(p.indent || 0) : 0));
+        return Math.max(40, avail0 - PX(p.marL) - (!hanging && firstLine ? PX(p.indent || 0) : 0));
       };
 
       // Words come from ALL runs of the paragraph: adjacent runs stay
@@ -2124,7 +3329,7 @@ if (typeof module !== "undefined" && module.exports) {
       if (cur.length) lines.push(cur);
       for (let i = 0; i < lines.length; i++) {
         items.push({ ln: lines[i], lh: lh, p: p, bulletX: bulletX,
-          textX: bulletX + (i === 0 ? PX(p.indent || 0) : 0), first: i === 0 });
+          textX: hanging ? textL : bulletX + (i === 0 ? PX(p.indent || 0) : 0), first: i === 0 });
       }
       totalH += lines.length * lh;
     }
@@ -2178,46 +3383,63 @@ if (typeof module !== "undefined" && module.exports) {
   function drawPhTitle(ctx, sh, spec, scene, pxPerInch) {
     const style = scene.title;
     const r0 = sh.paras[0] && sh.paras[0].runs[0];
-    const szPt = (r0 && r0.szPt) || style.szPt;
+    const szPt = (r0 && r0.szPt) || style.szPt;   // the placeholder's size, else the master's
     const bold = (r0 && r0.bold) || style.bold;
     const p0 = sh.paras[0];
     const algn = (p0 && p0.hasPPr) ? p0.algn : style.algn;
     const font = (r0 && r0.font) || style.font || scene.fontFallback;
-    const text = spec.kind === "plan" ? "\u041F\u043B\u0430\u043D" : (spec.title || "");
+    const text = spec.title || "";
     drawParas(ctx, sh, [{ lvl: 0, algn: algn, marL: 0, indent: 0, bullet: null,
-      runs: [{ text: text, bold: bold, szPt: szPt, color: "#000000", font: font, u: false }] }], pxPerInch);
+      runs: [{ text: text, bold: bold, szPt: szPt, color: (r0 && r0.color) || style.color || "#000000",
+        font: font, u: false }] }], pxPerInch);
+  }
+
+  // A bullet or number whose list level has no hanging indent gets one of
+  // 0.25 in, as the engine stamps (engine.py:list_fixes).
+  function hung(L) {
+    return (L.indent || 0) === 0 ? Object.assign({}, L, { marL: (L.marL || 0) + HANG, indent: -HANG }) : L;
   }
 
   function drawPhBody(ctx, sh, spec, scene, pxPerInch) {
     const font = scene.body.font || scene.fontFallback;
     const L0 = scene.bodyLvl0;
     const L1 = scene.bodyLvl1;
+    const L0h = hung(L0), L1h = hung(L1);
     let paras;
     if (spec.kind === "plan") {
-      paras = spec.items.map(function (t) {
-        return { lvl: 0, algn: "l", marL: L0.marL, indent: L0.indent, bullet: null,
-          runs: [{ text: t, bold: false, szPt: spec.toc, color: "#000000", font: font, u: false }] };
+      const planLabels = numberLabels(spec.items.map(function (t) { return t[1]; }));
+      paras = spec.items.map(function (t, k) {
+        const Lp = planLabels[k] ? L0h : L0;
+        return { lvl: 0, algn: "l", marL: Lp.marL, indent: Lp.indent, bullet: planLabels[k],
+          runs: [{ text: t[0], bold: false, szPt: spec.toc, color: scene.body.color || "#000000", font: font, u: false }] };
       });
-    } else if (spec.body && spec.body.length) {
-      paras = spec.body.filter(function (p) { return p[0] !== "table"; }).map(function (p) {
-        const lvl = p[0];
-        return {
-          lvl: lvl, algn: "l",
-          marL: lvl > 0 ? L1.marL : L0.marL,
-          indent: lvl > 0 ? L1.indent : L0.indent,
-          bullet: lvl > 0 ? (L1.bullet || "\u2022") : null,
-          runs: p[1].map(function (r) {
-            return { text: r[0], bold: r[1], ital: r[2] || false, szPt: spec.bodyPt,
-              color: (r.length > 4 && r[4]) ? r[4] : "#000000",
-              font: (r.length > 5 && r[5]) ? r[5] : font, u: r[3] || false };
-          }),
-        };
-      });
-    }
-    if (spec.tables) {
-      for (const tb of spec.tables) {
-        drawTableGeom(ctx, tb[0], tb[1], spec.tablePt,
-          scene.body.font || scene.fontFallback, pxPerInch, scene.tablePalette);
+    } else if (spec.columns) {
+      for (const col of spec.columns) {
+        const colSh = Object.assign({}, sh, { x: col.box[0], y: col.box[1], w: col.box[2], h: col.box[3] });
+        const textItems = col.items.filter(function (p) { return typeof p[0] === "number"; });
+        const labels = numberLabels(textItems.map(function (p) { return p[2]; }));
+        const colParas = textItems.map(function (p, k) {
+          const lvl = p[0];
+          return {
+            lvl: lvl, algn: "l",
+            marL: lvl > 0 ? L1h.marL : L0.marL,
+            indent: lvl > 0 ? L1h.indent : L0.indent,
+            bullet: labels[k] || (lvl > 0 ? (L1.bullet || "\u2022") : null),
+            runs: p[1].map(function (r) {
+              return { text: r[0], bold: r[1], ital: r[2] || false, szPt: col.pt,
+                color: (r.length > 4 && r[4]) ? r[4] : (scene.body.color || "#000000"),
+                font: (r.length > 5 && r[5]) ? r[5] : font, u: r[3] || false };
+            }),
+          };
+        });
+        for (const fr of col.flow.frames) {
+          if (fr[0] === "table") {
+            drawTableGeom(ctx, fr[1], fr[2], fr[2].pt, font, pxPerInch, scene.tablePalette, scene.body.color);
+          } else {
+            drawChart(ctx, fr[1], fr[2], font, pxPerInch, scene.accents, spec.tablePt, scene.body.color);
+          }
+        }
+        if (colParas.length) drawParas(ctx, colSh, colParas, pxPerInch);
       }
     }
     if (paras && paras.length) drawParas(ctx, sh, paras, pxPerInch);
@@ -2249,11 +3471,13 @@ if (typeof module !== "undefined" && module.exports) {
     if (paras.length) drawParas(ctx, sh, paras, pxPerInch);
   }
 
-  // Draw a generated pipe table (its EMU geometry comes from slideLayout, the
+  // Draw a generated pipe table (its EMU geometry comes from columnFlow, the
   // same call the engine used). Paint comes from tablePalette(), i.e. from the
   // template's default table style as the renderers read it: banded row fills,
   // a solid header row, and no inner grid unless the style asks for rules.
-  function drawTableGeom(ctx, tbl, geom, tablePt, font, pxPerInch, pal) {
+  // `textColor` is the template's body text colour, used for cells whose
+  // style has no fills.
+  function drawTableGeom(ctx, tbl, geom, tablePt, font, pxPerInch, pal, textColor) {
     const pal2 = pal || { head: "#e9e9e9", headText: "#000000", band: ["#ffffff", "#ffffff"], line: "#8a8a8a" };
     const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
     const x0 = PX(geom.x), y0 = PX(geom.y), w = PX(geom.cx), hTot = PX(geom.cy);
@@ -2276,36 +3500,48 @@ if (typeof module !== "undefined" && module.exports) {
       ctx.fillStyle = hex;
       ctx.fillRect(x0, rowTop[rr], w, rowPx[rr]);
     };
-    fillRow(0, pal2.head);
-    for (let rr = 1; rr < nrows; rr++) fillRow(rr, pal2.band[(rr - 1) % 2]);
-    if (pal2.line) {
-      ctx.strokeStyle = pal2.line;
+    // `style: plain|grid` carry no fills; `grid` has rules; `header: off` and
+    // `banded: off` drop the header fill and the band fills
+    const painted = tbl.style === "default";
+    if (painted && tbl.firstRow) fillRow(0, pal2.head);
+    if (painted && tbl.banded) {
+      for (let rr = tbl.firstRow ? 1 : 0; rr < nrows; rr++) {
+        fillRow(rr, pal2.band[(rr - (tbl.firstRow ? 1 : 0)) % 2]);
+      }
+    }
+    const rule = tbl.style === "grid" ? "#7f7f7f" : (painted ? pal2.line : null);
+    if (rule) {
+      // one rectangle per cell range, so no rule runs through a merged cell
+      ctx.strokeStyle = rule;
       ctx.lineWidth = 1;
-      ctx.beginPath();
       for (let rr = 0; rr < nrows; rr++) {
-        const yy = rowTop[rr];
-        ctx.moveTo(x0, yy); ctx.lineTo(x0 + w, yy);
+        let xCur = x0;
+        for (let cc = 0; cc < ncols; cc++) {
+          const sp = tbl.spans ? tbl.spans[rr][cc] : [1, 1, false, false];
+          if (!sp[2] && !sp[3]) {
+            let wSpan = 0, hSpan = 0;
+            for (let k = cc; k < cc + sp[0]; k++) wSpan += colPx[k];
+            for (let k = rr; k < rr + sp[1]; k++) hSpan += rowPx[k];
+            ctx.strokeRect(xCur, rowTop[rr], wSpan, hSpan);
+          }
+          xCur += colPx[cc];
+        }
       }
-      ctx.moveTo(x0, y0 + hTot); ctx.lineTo(x0 + w, y0 + hTot);
-      let xCur = x0;
-      for (let cc = 0; cc < ncols; cc++) {
-        ctx.moveTo(xCur, y0); ctx.lineTo(xCur, y0 + hTot);
-        if (cc < ncols - 1) xCur += colPx[cc];
-      }
-      ctx.moveTo(x0 + w, y0); ctx.lineTo(x0 + w, y0 + hTot);
-      ctx.stroke();
     }
     for (let rr = 0; rr < nrows; rr++) {
       let cx = x0;
       for (let cc = 0; cc < ncols; cc++) {
         const cell = tbl.cells[rr][cc] || [];
         const align = tbl.align[cc] || "l";
-        const inner = colPx[cc] - 2 * padPx;
+        const span = tbl.spans ? tbl.spans[rr][cc] : [1, 1, false, false];
+        let spanPx = 0;
+        for (let k = cc; k < cc + span[0]; k++) spanPx += colPx[k];
+        const inner = spanPx - 2 * padPx;
         if (cell.length && inner > 4) {
           const words = [];
           for (const run of cell) {
             const fnt = (run.length > 5 && run[5]) ? run[5] : font;
-            const bold = rr === 0 || (run.length > 1 && run[1]);
+            const bold = (rr === 0 && tbl.header) || (tbl.firstCol && cc === 0) || (run.length > 1 && run[1]);
             const ital = run.length > 2 && run[2];
             ctx.font = fontStr(tablePt, bold, fnt, pxPerInch, ital);
             for (const p2 of String(run[0]).split(/\s+/)) {
@@ -2325,11 +3561,11 @@ if (typeof module !== "undefined" && module.exports) {
           for (const pair of lines) {
             const lns = pair[0], lw = pair[1];
             let lx = cx + padPx;
-            if (align === "ctr") lx = cx + (colPx[cc] - lw) / 2;
-            else if (align === "r") lx = cx + colPx[cc] - padPx - lw;
+            if (align === "ctr") lx = cx + (spanPx - lw) / 2;
+            else if (align === "r") lx = cx + spanPx - padPx - lw;
             for (const wd of lns) {
               const run = wd.run;
-              const col = (run.length > 4 && run[4]) ? run[4] : (rr === 0 ? pal2.headText : "#000000");
+              const col = (run.length > 4 && run[4]) ? run[4] : (rr === 0 && painted && tbl.firstRow ? pal2.headText : (painted ? "#000000" : (textColor || "#000000")));
               ctx.font = fontStr(tablePt, wd.bold, wd.fnt, pxPerInch, wd.ital);
               ctx.fillStyle = col;
               ctx.fillText(wd.t, lx, ly);
@@ -2350,6 +3586,187 @@ if (typeof module !== "undefined" && module.exports) {
         }
         cx += colPx[cc];
       }
+    }
+  }
+
+  // Office accent colours, used when the template's theme has none.
+  const PREVIEW_ACCENTS = ["#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#4BACC6", "#F79646"];
+
+  // Draw a chart where the engine put it (an approximation of what PowerPoint
+  // renders from the chart part): bars / columns, lines with markers or pie
+  // slices in the theme's accent colours, light gridlines, a legend where the
+  // chart part has one, and the title and data labels when asked for.
+  function drawChart(ctx, ch, geom, font, pxPerInch, accents, tablePt, textColor) {
+    const tc = textColor || "#000000";
+    const PX = function (v) { return v / EMU_PER_INCH * pxPerInch; };
+    const colors = accents && accents.length ? accents : PREVIEW_ACCENTS;
+    const pt = ch.pt || Math.max(TABLE_MIN_PT, tablePt - CHART_PT_BELOW_TABLE);
+    const x0 = PX(geom.x), y0 = PX(geom.y), w = PX(geom.cx), h = PX(geom.cy);
+    const px = fontPx(pt, pxPerInch);
+    const color = function (i) { return colors[i % colors.length]; };
+    ctx.textBaseline = "top";
+    let top = y0 + px * 0.3;
+    if (ch.title) {
+      ctx.font = fontStr(pt + 2, true, font, pxPerInch, false);
+      ctx.fillStyle = tc;
+      ctx.textAlign = "center";
+      ctx.fillText(ch.title, x0 + w / 2, top);
+      ctx.textAlign = "left";
+      top += px * 1.8;
+    }
+    let legend = ch.legend;
+    if (legend === null) legend = ch.type === "pie" ? "right" : (ch.series.length > 1 ? "bottom" : "off");
+    const names = ch.type === "pie" ? ch.cats : ch.series.map(function (s) { return s[0]; });
+    ctx.font = fontStr(pt, false, font, pxPerInch, false);
+    let left = x0, right = x0 + w, bottom = y0 + h - px * 0.3;
+    if (legend === "bottom" || legend === "top") {
+      let lx = x0 + w / 2;
+      let tot = 0;
+      for (const n of names) tot += ctx.measureText(n).width + px * 2.2;
+      lx -= tot / 2;
+      const ly = legend === "bottom" ? bottom - px * 1.2 : top;
+      names.forEach(function (n, i) {
+        ctx.fillStyle = color(i);
+        ctx.fillRect(lx, ly + px * 0.2, px * 0.7, px * 0.7);
+        ctx.fillStyle = tc;
+        ctx.fillText(n, lx + px * 1.0, ly);
+        lx += ctx.measureText(n).width + px * 2.2;
+      });
+      if (legend === "bottom") bottom -= px * 1.6; else top += px * 1.6;
+    } else if (legend === "left" || legend === "right") {
+      let lw = 0;
+      for (const n of names) lw = Math.max(lw, ctx.measureText(n).width);
+      lw += px * 1.6;
+      const lx = legend === "right" ? right - lw : left;
+      names.forEach(function (n, i) {
+        const ly = top + (bottom - top) / 2 - names.length * px * 0.7 + i * px * 1.4;
+        ctx.fillStyle = color(i);
+        ctx.fillRect(lx, ly + px * 0.2, px * 0.7, px * 0.7);
+        ctx.fillStyle = tc;
+        ctx.fillText(n, lx + px * 1.0, ly);
+      });
+      if (legend === "right") right -= lw + px; else left += lw + px;
+    }
+    if (ch.type === "pie") {
+      const vals = ch.series[0][1];
+      let sum = 0;
+      for (const v of vals) sum += Math.abs(v);
+      const r = Math.max(4, Math.min(right - left, bottom - top) / 2 - px * 0.5);
+      const cx = (left + right) / 2, cy = (top + bottom) / 2;
+      let ang = -Math.PI / 2;
+      vals.forEach(function (v, i) {
+        const da = sum ? Math.abs(v) / sum * Math.PI * 2 : 0;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, r, ang, ang + da);
+        ctx.closePath();
+        ctx.fillStyle = color(i);
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        if (ch.labels && sum) {
+          const mid = ang + da / 2;
+          ctx.fillStyle = tc;
+          ctx.textAlign = "center";
+          ctx.fillText(Math.round(Math.abs(v) / sum * 100) + "%", cx + Math.cos(mid) * r * 0.65, cy + Math.sin(mid) * r * 0.65 - px * 0.5);
+          ctx.textAlign = "left";
+        }
+        ang += da;
+      });
+      return;
+    }
+    // axes: columns / lines have the categories along the bottom, bars along the left
+    const horiz = ch.type === "bar";
+    const nc = ch.cats.length;
+    const nice = function (m) {
+      const e = Math.pow(10, Math.floor(Math.log10(m || 1)));
+      for (const k of [1, 2, 2.5, 5, 10]) if (k * e >= m) return k * e;
+      return 10 * e;
+    };
+    let lo = 0, hi = 0;
+    if (ch.stacked) {
+      for (let i = 0; i < nc; i++) {
+        let t = 0;
+        for (const s of ch.series) t += Math.max(0, s[1][i]);
+        hi = Math.max(hi, t);
+      }
+    } else {
+      for (const s of ch.series) for (const v of s[1]) { hi = Math.max(hi, v); lo = Math.min(lo, v); }
+    }
+    hi = nice(hi);
+    const tick = hi / 5;
+    let maxLab = 0;
+    for (let v = lo; v <= hi + 1e-9; v += tick) maxLab = Math.max(maxLab, ctx.measureText(String(Math.round(v * 100) / 100)).width);
+    let catLab = 0;
+    for (const c of ch.cats) catLab = Math.max(catLab, ctx.measureText(c).width);
+    const pl = (horiz ? catLab : maxLab) + px * 1.0 + left;
+    const pb = bottom - px * 1.5;
+    const pr = right - px * 0.5;
+    const pt0 = top + px * 0.5;
+    const plotW = pr - pl, plotH = pb - pt0;
+    const vToX = function (v) { return pl + (v - lo) / (hi - lo) * plotW; };
+    const vToY = function (v) { return pb - (v - lo) / (hi - lo) * plotH; };
+    ctx.strokeStyle = "#D9D9D9";
+    ctx.lineWidth = 1;
+    ctx.fillStyle = tc;
+    for (let v = lo; v <= hi + 1e-9; v += tick) {
+      const lab = String(Math.round(v * 100) / 100);
+      ctx.beginPath();
+      if (horiz) { ctx.moveTo(vToX(v), pt0); ctx.lineTo(vToX(v), pb); } else { ctx.moveTo(pl, vToY(v)); ctx.lineTo(pr, vToY(v)); }
+      ctx.stroke();
+      if (horiz) { ctx.textAlign = "center"; ctx.fillText(lab, vToX(v), pb + px * 0.3); } else { ctx.textAlign = "right"; ctx.fillText(lab, pl - px * 0.4, vToY(v) - px * 0.5); }
+    }
+    ctx.textAlign = "left";
+    const ns = ch.series.length;
+    const band = (horiz ? plotH : plotW) / nc;
+    for (let i = 0; i < nc; i++) {
+      const mid = (horiz ? pt0 : pl) + band * (i + 0.5);
+      ctx.fillStyle = tc;
+      if (horiz) { ctx.textAlign = "right"; ctx.fillText(ch.cats[i], pl - px * 0.4, mid - px * 0.5); }
+      else { ctx.textAlign = "center"; ctx.fillText(ch.cats[i], mid, pb + px * 0.3); }
+      ctx.textAlign = "left";
+    }
+    if (ch.type === "line") {
+      ch.series.forEach(function (s, j) {
+        ctx.strokeStyle = color(j);
+        ctx.fillStyle = color(j);
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        s[1].forEach(function (v, i) {
+          const xx = pl + band * (i + 0.5), yy = vToY(v);
+          if (i) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy);
+        });
+        ctx.stroke();
+        s[1].forEach(function (v, i) {
+          ctx.beginPath();
+          ctx.arc(pl + band * (i + 0.5), vToY(v), 3.5, 0, Math.PI * 2);
+          ctx.fill();
+          if (ch.labels) { ctx.fillStyle = tc; ctx.textAlign = "center"; ctx.fillText(String(v), pl + band * (i + 0.5), vToY(v) - px * 1.5); ctx.textAlign = "left"; ctx.fillStyle = color(j); }
+        });
+      });
+      return;
+    }
+    for (let i = 0; i < nc; i++) {
+      let acc = 0;
+      ch.series.forEach(function (s, j) {
+        const v = s[1][i];
+        const bw = ch.stacked ? band * 0.55 : band * 0.7 / ns;
+        const off = ch.stacked ? band * 0.225 : band * 0.15 + j * bw;
+        const a = ch.stacked ? lo + acc : lo, b = ch.stacked ? lo + acc + v : v;
+        ctx.fillStyle = color(j);
+        let bx, by, bwid, bhgt;
+        if (horiz) { bx = vToX(Math.min(a, b)); bwid = Math.abs(vToX(b) - vToX(a)); by = pt0 + band * i + off; bhgt = bw; }
+        else { bx = pl + band * i + off; bwid = bw; by = vToY(Math.max(a, b)); bhgt = Math.abs(vToY(b) - vToY(a)); }
+        ctx.fillRect(bx, by, bwid, bhgt);
+        if (ch.labels) {
+          ctx.fillStyle = tc;
+          ctx.textAlign = "center";
+          if (horiz) ctx.fillText(String(v), bx + bwid + px * 1.2, by + bhgt / 2 - px * 0.5); else ctx.fillText(String(v), bx + bwid / 2, by - px * 1.3);
+          ctx.textAlign = "left";
+        }
+        acc += Math.max(0, v);
+      });
     }
   }
 
@@ -2377,10 +3794,11 @@ if (typeof module !== "undefined" && module.exports) {
         ctx.fillStyle = sh.fill;
         ctx.fillRect(PX(sh.x), PX(sh.y), PX(sh.w), PX(sh.h));
       }
-      if (sh.ph === "title") drawPhTitle(ctx, sh, spec, scene, pxPerInch);
-      else if (sh.ph === "body") drawPhBody(ctx, sh, spec, scene, pxPerInch);
-      else if (sh.ph === "sldNum") drawSldNum(ctx, sh, spec, pxPerInch);
+      if (sh.ph === "sldNum") drawSldNum(ctx, sh, spec, pxPerInch);
       else if (sh.ph === "dt" || sh.ph === "ftr") { /* template-only; skip */ }
+      else if (spec.kind === "title") drawFreeform(ctx, sh, spec, scene, pxPerInch);
+      else if (sh.ph === "title") drawPhTitle(ctx, sh, spec, scene, pxPerInch);
+      else if (sh.ph === "body") drawPhBody(ctx, sh, spec, scene, pxPerInch);
       else drawFreeform(ctx, sh, spec, scene, pxPerInch);
     }
   }
@@ -2406,10 +3824,8 @@ if (typeof module !== "undefined" && module.exports) {
     };
 
     if (spec.kind === "title") {
-      // freeform title slide: approximate (Доклад + topic, wrapped)
+      // freeform title slide: approximate (the topic, wrapped)
       ctx.textAlign = "center";
-      ctx.font = fontCss(fontPx(44, pxPerInch), true);
-      ctx.fillText("Доклад", pxW / 2, pxH * 0.30);
       ctx.font = fontCss(fontPx(18, pxPerInch), true);
       const tl = wrapCentered(ctx, spec.topic, pxW * 0.85);
       const tlh = fontPx(18, pxPerInch) * 1.22;
@@ -2421,23 +3837,25 @@ if (typeof module !== "undefined" && module.exports) {
       drawRuns(ctx, [[spec.title, false]], t.x, t.y + fontPx(18, pxPerInch), t.w, fontPx(18, pxPerInch), 0, pxPerInch);
       const b = emuToPx(CONTENT_BODY_OFF);
       let y = b.y + fontPx(spec.toc, pxPerInch);
-      for (const item of spec.items) {
-        y = drawRuns(ctx, [[item, false]], b.x, y, b.w, fontPx(spec.toc, pxPerInch), 0, pxPerInch);
-      }
+      const planLabels = numberLabels(spec.items.map(function (t) { return t[1]; }));
+      spec.items.forEach(function (item, k) {
+        y = drawRuns(ctx, [[item[0], false]], b.x, y, b.w, fontPx(spec.toc, pxPerInch), 0, pxPerInch, planLabels[k]);
+      });
     } else if (spec.kind === "content") {
       const t = emuToPx(CONTENT_TITLE_OFF);
       drawRuns(ctx, [[spec.title || "", false]], t.x, t.y + fontPx(18, pxPerInch), t.w, fontPx(18, pxPerInch), 0, pxPerInch);
-      const b = emuToPx(CONTENT_BODY_OFF);
-      const sizePx = fontPx(spec.bodyPt, pxPerInch);
-      let y = b.y + sizePx;
-      for (const p of spec.body) {
-        if (p[0] === "table") continue;
-        const lv = p[0], runs = p[1];
-        y = drawRuns(ctx, runs, b.x, y, b.w, sizePx, lv, pxPerInch);
-      }
-      if (spec.tables) {
-        for (const tb of spec.tables) {
-          drawTableGeom(ctx, tb[0], tb[1], spec.tablePt, "Times New Roman", pxPerInch);
+      for (const col of spec.columns) {
+        const b = emuToPx({ x: col.box[0], y: col.box[1], cx: col.box[2], cy: col.box[3] });
+        const sizePx = fontPx(col.pt, pxPerInch);
+        let y = b.y + sizePx;
+        const textItems = col.items.filter(function (p) { return typeof p[0] === "number"; });
+        const labels = numberLabels(textItems.map(function (p) { return p[2]; }));
+        textItems.forEach(function (p, k) {
+          y = drawRuns(ctx, p[1], b.x, y, b.w, sizePx, p[0], pxPerInch, labels[k]);
+        });
+        for (const fr of col.flow.frames) {
+          if (fr[0] === "table") drawTableGeom(ctx, fr[1], fr[2], fr[2].pt, "Times New Roman", pxPerInch);
+          else drawChart(ctx, fr[1], fr[2], "Times New Roman", pxPerInch, null, spec.tablePt);
         }
       }
     } else if (spec.kind === "closing") {
@@ -2452,12 +3870,14 @@ if (typeof module !== "undefined" && module.exports) {
     return c;
   }
 
-  async function makePreview(doc, bodyPt, scenes) {
-    const pxW = 960, pxH = 720; // 10in x 7.5in at 96 px/inch
+  async function makePreview(doc, bodyPt, scenes, layouts) {
+    const pxW = 960;
+    const pxH = Math.round(pxW * SLIDE_H / SLIDE_W); // the template's aspect at 96 px/inch
+    const pgW = SLIDE_W / EMU_PER_INCH, pgH = SLIDE_H / EMU_PER_INCH;
     const jspdf = window.jspdf;
     if (!jspdf || !jspdf.jsPDF) throw new Error("jsPDF not loaded");
-    const pdf = new jspdf.jsPDF({ unit: "in", format: [10, 7.5], orientation: "landscape" });
-    const specs = slideSpecs(doc, bodyPt);
+    const pdf = new jspdf.jsPDF({ unit: "in", format: [pgW, pgH], orientation: pgW >= pgH ? "landscape" : "portrait" });
+    const specs = slideSpecs(doc, bodyPt, layouts);
     specs.forEach(function (spec, idx) {
       spec.page = idx + 1;
       let scene = null;
@@ -2467,9 +3887,9 @@ if (typeof module !== "undefined" && module.exports) {
         else if (spec.kind === "closing") scene = scenes[3];
         else scene = scenes[2]; // every content slide is the template's slide3 type
       }
-      if (idx > 0) pdf.addPage([10, 7.5], "landscape");
+      if (idx > 0) pdf.addPage([pgW, pgH], pgW >= pgH ? "landscape" : "portrait");
       const c = renderSlide(spec, pxW, pxH, scene);
-      pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, 10, 7.5);
+      pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, pgW, pgH);
     });
     const f = $("pdf");
     // Object URL, NOT a data: URL: Chromium blocks data: URLs larger than

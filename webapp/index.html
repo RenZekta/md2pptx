@@ -93,6 +93,29 @@
     color: #aab3c5; background: #14161d; border: 1px solid var(--line); border-radius: 8px;
     padding: 10px 12px; min-height: 44px; max-height: 240px; overflow: auto;
   }
+  .settings { display: grid; gap: 12px; }
+  .setting { display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; align-items: center; }
+  .setting label, .setting-label { font-size: 13px; font-weight: 600; }
+  .setting .hint { grid-column: 2; margin-top: -2px; }
+  @media (max-width: 520px) {
+    .setting { grid-template-columns: 1fr; }
+    .setting .hint { grid-column: 1; }
+  }
+  .settings input[type=text], .settings input[type=number] {
+    font: inherit; font-size: 13px; width: 100%;
+    color: var(--ink); background: #14161d;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; outline: none;
+  }
+  .settings input[type=text]:focus, .settings input[type=number]:focus {
+    border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 70, 229, .16);
+  }
+  .settings input.mono { font-family: var(--mono); font-size: 12.5px; }
+  .settings details { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .settings summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  .settings details[open] summary { margin-bottom: 12px; }
+  .settings details .settings { margin-top: 2px; }
+  .switch-row { display: grid; gap: 4px; }
   iframe { width: 100%; height: 520px; border: 1px solid var(--line); border-radius: 8px; background: #fff; display: none; }
 </style>
 </head>
@@ -145,6 +168,55 @@ Thank you"></textarea>
           <div class="drop-icon"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg></div>
           <div class="drop-main">Drop template.pptx here</div>
           <div class="drop-hint">or click to browse</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Settings</h2>
+        <div class="settings">
+          <div class="hint">Defaults for every build. A setting written in the structure.md front matter wins over these. Saved in this browser.</div>
+          <div class="setting">
+            <label for="setLang">Proofing language</label>
+            <input type="text" id="setLang" list="langList" placeholder="template default" autocomplete="off" spellcheck="false">
+            <datalist id="langList">
+              <option value="ru-RU"><option value="en-US"><option value="en-GB"><option value="de-DE">
+              <option value="fr-FR"><option value="es-ES"><option value="it-IT"><option value="uk-UA">
+              <option value="pl-PL"><option value="tr-TR"><option value="zh-CN"><option value="ja-JP">
+            </datalist>
+            <div class="hint">BCP-47 tag stamped on every generated run, so PowerPoint does not flag the text as misspelled.</div>
+          </div>
+          <div class="setting">
+            <label for="setBody">Body size, pt</label>
+            <input type="number" id="setBody" min="1" max="200" step="1" placeholder="template default">
+            <div class="hint">Plan items, table cells and chart text render at this size minus 1.</div>
+          </div>
+          <div class="switch-row">
+            <label class="check"><input type="checkbox" id="setTableFill" checked> Colour tables from the theme</label>
+            <div class="hint">A table whose style paints no cell (<code>style: grid</code> or <code>plain</code>) gets the template's default table style instead: accent-coloured header row, filled body rows, all from the theme. Turn off to keep such tables as written.</div>
+          </div>
+          <details id="kwBox">
+            <summary>Template keywords</summary>
+            <div class="settings">
+              <div class="hint">What the engine looks for in the template's own slides. Change these when a custom template does not match the defaults; leave a field empty to use its default.</div>
+              <div class="setting">
+                <label for="setAnchors">Topic anchors</label>
+                <input type="text" class="mono" id="setAnchors" placeholder="На тему (keep), Topic" autocomplete="off" spellcheck="false">
+                <div class="hint">Text on the title slide marking the topic line, tried in order. <code>(keep)</code> keeps the anchor in front of the topic ("На тему: …"); otherwise the topic replaces the whole line.</div>
+              </div>
+              <div class="setting">
+                <label for="setTitleMarker">Title placeholder</label>
+                <input type="text" class="mono" id="setTitleMarker" placeholder="&lt;p:ph type=&quot;title&quot;/&gt;" autocomplete="off" spellcheck="false">
+                <div class="hint">The title placeholder tag as written in the template's slide XML.</div>
+              </div>
+              <div class="setting">
+                <label for="setBodyMarker">Body placeholder</label>
+                <input type="text" class="mono" id="setBodyMarker" placeholder="&lt;p:ph idx=&quot;1&quot;/&gt;" autocomplete="off" spellcheck="false">
+                <div class="hint">The body placeholder tag on the plan and content slides.</div>
+              </div>
+            </div>
+          </details>
+          <div class="actions">
+            <button class="btn btn-soft" id="setReset" type="button">Reset to defaults</button>
+          </div>
         </div>
       </div>
       <div class="card">
@@ -602,13 +674,82 @@ const BODY_MARKER = '<p:ph idx="1"/>';         // body placeholder
 const TITLE_ANCHOR_RU = "На тему";             // topic-line anchor in the title slide
 const TITLE_ANCHOR_EN = "Topic";               // English title-slide topic-line anchor
 
-function topicAnchor(titleXml) {
-  // Anchor present in the title slide: Russian first, then English;
-  // throws when neither is found.
-  if (titleXml.indexOf(TITLE_ANCHOR_RU) >= 0) return TITLE_ANCHOR_RU;
-  if (titleXml.indexOf(TITLE_ANCHOR_EN) >= 0) return TITLE_ANCHOR_EN;
+// Template keywords: the strings the engine looks for in the template's own
+// slides. `topicAnchors` are tried in order against the title slide; the one
+// found marks the topic line, and `keep` says whether the anchor stays in
+// front of the topic ("На тему: <topic>") or the line is replaced by the
+// topic alone. The markers are literal substrings of the placeholder tags in
+// the slide XML.
+const DEFAULT_KEYWORDS = {
+  topicAnchors: [[TITLE_ANCHOR_RU, true], [TITLE_ANCHOR_EN, false]],
+  titleMarker: TITLE_MARKER,
+  bodyMarker: BODY_MARKER
+};
+
+// [[anchor, keep]] from a comma-separated list. An entry ending in `(keep)`
+// keeps its anchor as a prefix of the topic line; entries are trimmed and
+// empty ones dropped.
+function parseAnchors(text) {
+  const out = [];
+  for (const raw of String(text).split(",")) {
+    let item = raw.trim(), keep = false;
+    const m = /^([\s\S]*?)\s*\(keep\)$/i.exec(item);
+    if (m) { item = m[1].trim(); keep = true; }
+    if (item) out.push([item, keep]);
+  }
+  return out;
+}
+
+// DEFAULT_KEYWORDS with the topic_anchors, title_marker and body_marker
+// entries of `settings` applied. Blank values keep the default; a marker must
+// be a <p:ph .../> tag.
+function resolveKeywords(settings) {
+  const s = settings || {};
+  const kw = { topicAnchors: DEFAULT_KEYWORDS.topicAnchors.slice(),
+    titleMarker: DEFAULT_KEYWORDS.titleMarker, bodyMarker: DEFAULT_KEYWORDS.bodyMarker };
+  const anchors = parseAnchors(s.topic_anchors || "");
+  if (anchors.length) kw.topicAnchors = anchors;
+  [["title_marker", "titleMarker"], ["body_marker", "bodyMarker"]].forEach(function (pair) {
+    const v = String(s[pair[0]] || "").trim();
+    if (!v) return;
+    if (!/^<p:ph\b[^<>]*\/?>$/.test(v)) {
+      throw new Error(pair[0] + " '" + v + "' is not a placeholder tag (expected " +
+        "something like <p:ph type=\"title\"/>)");
+    }
+    kw[pair[1]] = v;
+  });
+  return kw;
+}
+
+// [anchor, keep] of the first topic anchor present in the title slide;
+// throws when none is found.
+function topicAnchor(titleXml, kw) {
+  const anchors = (kw || DEFAULT_KEYWORDS).topicAnchors;
+  for (const a of anchors) {
+    if (titleXml.indexOf(a[0]) >= 0) return a;
+  }
   throw new Error("no title-slide topic anchor found (expected " +
-    TITLE_ANCHOR_RU + " or " + TITLE_ANCHOR_EN + ")");
+    anchors.map(function (a) { return "'" + a[0] + "'"; }).join(" or ") + ")");
+}
+
+// Fail early, naming the setting to change, when a template slide lacks the
+// keyword the engine needs from it.
+function checkTemplateKeywords(slideXml, kw, needPlan, needClosing) {
+  const need = [[TITLE_SLIDE, "title slide", null],
+    [CONTENT_SLIDE, "content slide (slide3)", [kw.titleMarker, kw.bodyMarker]]];
+  if (needPlan) need.push([PLAN_SLIDE, "plan slide (slide2)", [kw.titleMarker, kw.bodyMarker]]);
+  if (needClosing) need.push([CLOSE_SLIDE, "closing slide (slide4)", [kw.titleMarker]]);
+  for (const n of need) {
+    const xml = slideXml[n[0]];
+    if (n[2] === null) { topicAnchor(xml, kw); continue; }
+    for (const m of n[2]) {
+      if (xml.indexOf(m) < 0) {
+        const key = m === kw.titleMarker ? "title_marker" : "body_marker";
+        throw new Error("the template's " + n[1] + " has no placeholder matching " +
+          key + " '" + m + "'; set " + key + " to the placeholder tag it uses");
+      }
+    }
+  }
 }
 const CONTENT_SLIDE = "ppt/slides/slide3.xml";
 const CONTENT_RELS = "ppt/slides/_rels/slide3.xml.rels";
@@ -1401,9 +1542,9 @@ function layoutBodyBlock(geo, relsXml, idx) {
 // [box, layout block] of the clone prototype's body placeholder. The box is
 // the slide's own geometry, else its layout's, else the master's; the block is
 // the layout's placeholder (null without one).
-function defaultBody(geo, contentXml, contentRels) {
+function defaultBody(geo, contentXml, contentRels, kw) {
   const block = layoutBodyBlock(geo, contentRels, 1);
-  const box = spBox(spBlock(contentXml, BODY_MARKER)) || spBox(block);
+  const box = spBox(spBlock(contentXml, (kw || DEFAULT_KEYWORDS).bodyMarker)) || spBox(block);
   return [box || masterBodyBox(geo), block];
 }
 
@@ -1448,10 +1589,10 @@ function blockSz(block) {
 //           link it to the layout placeholder
 //   spacing effectiveSpacing() at the column's size
 // `dflt` is defaultBody()'s [box, block] (engine.py:plan_slide).
-function planSlide(geo, dflt, bodyPt, layoutKey, ncols) {
+function planSlide(geo, dflt, bodyPt, layoutKey, ncols, kw) {
   const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
   if (layoutKey === null && ncols === 1) {
-    return { file: null, phs: [{ tag: BODY_MARKER, box: dflt[0], pt: bodyPt, block: dflt[1],
+    return { file: null, phs: [{ tag: (kw || DEFAULT_KEYWORDS).bodyMarker, box: dflt[0], pt: bodyPt, block: dflt[1],
       orphan: false, spacing: effectiveSpacing(dflt[1], masterXml, bodyPt) }] };
   }
   const catalog = layoutCatalog(geo);
@@ -1979,8 +2120,8 @@ function packageSlots(names, pres, presRels) {
 
 // The plan slide's title as the template has it, minus a trailing
 // parenthesised remark (a template hint such as "Plan (if any)").
-function planTitleText(planXml) {
-  const block = spBlock(planXml, TITLE_MARKER) || "";
+function planTitleText(planXml, kw) {
+  const block = spBlock(planXml, (kw || DEFAULT_KEYWORDS).titleMarker) || "";
   const text = unesc((block.match(/<a:t>([^<]*)<\/a:t>/g) || []).map(function (t) {
     return t.slice(5, -6);
   }).join("")).trim();
@@ -2093,10 +2234,21 @@ function tableStyleId(tableStylesXml) {
   return m ? m[1] : TABLE_STYLE_DEFAULT;
 }
 
+// Whether the table style paints any cell fill. The two built-in "No Style"
+// GUIDs never do; a style the template defines does when its XML holds an
+// <a:fill>; any other GUID is a built-in PowerPoint resolves itself and is
+// taken to colour its cells (engine.py:style_has_fills).
+function styleHasFills(styleId, tableStylesXml) {
+  if (styleId === TABLE_STYLES.plain || styleId === TABLE_STYLES.grid) return false;
+  const esc2 = styleId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp('<a:tblStyle\\b[^>]*\\bstyleId="' + esc2 + '"[\\s\\S]*?</a:tblStyle>').exec(tableStylesXml);
+  return m ? m[0].indexOf("<a:fill>") >= 0 : true;
+}
+
 // Effective body font size (pt) of the template's content slide:
 // slide3 body placeholder -> its slide layout -> OOXML default 18 pt.
-async function resolveBodySize(zip, contentXml) {
-  const sz = placeholderSz(contentXml, BODY_MARKER);
+async function resolveBodySize(zip, contentXml, kw) {
+  const sz = placeholderSz(contentXml, (kw || DEFAULT_KEYWORDS).bodyMarker);
   if (sz) return sz;
   const rels = await (await zip.file(CONTENT_RELS).async("string"));
   const m = rels.match(/Target="([^"]*slideLayout\d+\.xml)"/);
@@ -2117,35 +2269,84 @@ async function resolveBodySize(zip, contentXml) {
   return 18;
 }
 
-function parseMd(text) {
+const FRONT_KEYS = ["body_size", "lang", "table_theme_fill", "topic_anchors",
+  "title_marker", "body_marker"];
+
+// true / false from an on-off setting (on, off, true, false, yes, no, 1, 0);
+// anything else throws.
+function parseSwitch(text, key) {
+  const t = String(text === undefined || text === null ? "" : text).trim().toLowerCase();
+  if (t === "on" || t === "true" || t === "yes" || t === "1") return true;
+  if (t === "off" || t === "false" || t === "no" || t === "0") return false;
+  throw new Error(key + " expects on or off, got '" + text + "'");
+}
+
+// Read the settings block at the top of structure.md. Returns
+// { settings, start, warnings }: `settings` maps setting names to their text,
+// `start` is the index of the first line after the block. The block is the
+// `---` fenced one or, without a fence, the `key: value` lines before the
+// first `# ` heading; a byte-order mark and blank lines in front of it are
+// skipped. Unknown keys and stray text are reported in `warnings` instead of
+// being dropped silently.
+function frontMatter(lines) {
+  const n = lines.length;
+  const settings = {}, warnings = [];
+  const bare = function (line) { return line.replace(/^\uFEFF/, ""); };
+  const take = function (raw) {
+    const line = bare(raw);
+    if (!line.trim()) return;
+    const at = line.indexOf(":");
+    const key = at < 0 ? "" : line.slice(0, at).trim().toLowerCase().replace(/-/g, "_");
+    if (at < 0 || !/^[a-z_][a-z0-9_]*$/.test(key)) {
+      warnings.push("ignored text before the first section: '" + line.trim().slice(0, 60) + "'");
+    } else if (FRONT_KEYS.indexOf(key) < 0) {
+      warnings.push("unknown setting '" + key + "' ignored (known: " + FRONT_KEYS.join(", ") + ")");
+    } else {
+      settings[key] = line.slice(at + 1).trim();
+    }
+  };
+  let i = 0;
+  while (i < n && !bare(lines[i]).trim()) i++;
+  if (i < n && bare(lines[i]).trim() === "---") {
+    i++;
+    while (i < n && lines[i].trim() !== "---") { take(lines[i]); i++; }
+    return { settings: settings, start: i < n ? i + 1 : i, warnings: warnings };
+  }
+  while (i < n && !lines[i].startsWith("# ")) { take(lines[i]); i++; }
+  return { settings: settings, start: i, warnings: warnings };
+}
+
+// Parse structure.md into the doc object buildZip consumes. `defaults` holds
+// the same settings as the front matter (from the web app's settings panel); a
+// setting written in the front matter wins over it.
+function parseMd(text, defaults) {
   const lines = text.split(/\r?\n/);
   const n = lines.length;
-  let i = 0;
+  const front = frontMatter(lines);
+  const i = front.start;
+  const warnings = front.warnings;
+  const settings = {};
+  Object.keys(defaults || {}).forEach(function (k) {
+    const v = String(defaults[k] === undefined || defaults[k] === null ? "" : defaults[k]).trim();
+    if (FRONT_KEYS.indexOf(k) >= 0 && v) settings[k] = v;
+  });
+  Object.keys(front.settings).forEach(function (k) { if (front.settings[k]) settings[k] = front.settings[k]; });
   let bodySize = null;
-  let lang = null;
-  if (n && lines[0].trim() === "---") {
-    i = 1;
-    const fm = {};
-    while (i < n && lines[i].trim() !== "---") {
-      if (lines[i].indexOf(":") >= 0) {
-        const k = lines[i].slice(0, lines[i].indexOf(":")).trim();
-        const v = lines[i].slice(lines[i].indexOf(":") + 1).trim();
-        fm[k] = v;
-      }
-      i++;
-    }
-    if (i < n) i++;
-    const bs = parseInt(fm["body_size"], 10);
-    bodySize = ("body_size" in fm) && !isNaN(bs) ? bs : null;
-    const langIn = (fm["lang"] || "").trim();
-    if (langIn) {
-      if (!/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/.test(langIn)) {
-        throw new Error("invalid lang '" + langIn + "' in structure.md " +
-          "front matter (expected a BCP-47 tag like ru-RU)");
-      }
-      lang = langIn;
-    }
+  if ("body_size" in settings) {
+    if (/^[+-]?\d+$/.test(settings.body_size)) bodySize = parseInt(settings.body_size, 10);
+    else warnings.push("body_size '" + settings.body_size + "' is not a whole number; ignored");
   }
+  let lang = null;
+  const langIn = settings.lang || "";
+  if (langIn) {
+    if (!/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/.test(langIn)) {
+      throw new Error("invalid lang '" + langIn + "' (expected a BCP-47 tag like ru-RU)");
+    }
+    lang = langIn;
+  }
+  const tableThemeFill = parseSwitch("table_theme_fill" in settings ? settings.table_theme_fill : "on",
+    "table_theme_fill");
+  const keywords = resolveKeywords(settings);
   // bodySize drives the plan slide (items at bodySize - 1), the table cells
   // (also bodySize - 1: a table has no placeholder to inherit a size from) and
   // the default chart text size. Body text takes its size from the template
@@ -2167,6 +2368,7 @@ function parseMd(text) {
   if (cur) sections.push(cur);
 
   const doc = { bodySize: bodySize, TOC: TOC, tablePt: TOC, lang: lang,
+    tableThemeFill: tableThemeFill, keywords: keywords, warnings: warnings,
     title: null, plan: null, planTitle: null, slides: [], closing: null };
   for (const sec of sections) {
     const header = sec[0], body = sec[1];
@@ -2205,7 +2407,14 @@ async function buildZip(templateBuffer, doc) {
   let ct = await getXml("[Content_Types].xml");
   const contentXml = await getXml(CONTENT_SLIDE);
   const contentRels = await getXml(CONTENT_RELS);
-  const bodyPt = await resolveBodySize(zip, contentXml);
+  const kw = doc.keywords || DEFAULT_KEYWORDS;
+  const titleMarker = kw.titleMarker, bodyMarker = kw.bodyMarker;
+  const slideXml = {};
+  for (const name of [TITLE_SLIDE, PLAN_SLIDE, CONTENT_SLIDE, CLOSE_SLIDE]) {
+    slideXml[name] = await getXml(name);
+  }
+  checkTemplateKeywords(slideXml, kw, doc.plan !== null, doc.closing !== null);
+  const bodyPt = await resolveBodySize(zip, contentXml, kw);
   if (doc.bodySize === null) {
     doc.bodySize = bodyPt;
     doc.TOC = doc.tablePt = bodyPt - 1;
@@ -2216,9 +2425,9 @@ async function buildZip(templateBuffer, doc) {
   // Resolved before anything is written so a bad layout fails early.
   const geo = await loadGeometryParts(zip);
   const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
-  const dflt = defaultBody(geo, contentXml, contentRels);
+  const dflt = defaultBody(geo, contentXml, contentRels, kw);
   const plans = doc.slides.map(function (sl) {
-    return planSlide(geo, dflt, bodyPt, sl[2], sl[1].length);
+    return planSlide(geo, dflt, bodyPt, sl[2], sl[1].length, kw);
   });
   doc.geom = plans.map(function (pl) {
     return pl.phs.map(function (ph) { return [ph.box, ph.pt, ph.spacing]; });
@@ -2259,14 +2468,14 @@ async function buildZip(templateBuffer, doc) {
   pres = pres.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, "<p:sldIdLst>" + sldids.join("") + "</p:sldIdLst>");
 
   // 4) title slide (topic line; bold, size inherited from the template;
-  //    the font of the original anchor run is kept). Russian standard: with
-  //    the RU anchor the engine keeps the "На тему: <тема>" format by
-  //    prepending "На тему: "; with the EN anchor the whole line is replaced
-  //    by the topic.
+  //    the font of the original anchor run is kept). An anchor marked `keep`
+  //    stays in front of the topic ("На тему: <тема>"); any other anchor's
+  //    whole line is replaced by the topic.
   let titleXml = await getXml(TITLE_SLIDE);
   const topic = doc.title || "";
-  const anchor = topicAnchor(titleXml);
-  const topicText = anchor === TITLE_ANCHOR_RU ? anchor + ": " + topic : topic;
+  const anchorHit = topicAnchor(titleXml, kw);
+  const anchor = anchorHit[0];
+  const topicText = anchorHit[1] ? anchor + ": " + topic : topic;
   const topicBase = firstRpr(titleXml, anchor);
   const topicPara = '<a:p><a:r>' + mergeRpr(topicBase, [true, false, false], null, doc.lang) +
     '<a:t>' + esc(topicText) + "</a:t></a:r>" + endParaRpr(doc.lang) + "</a:p>";
@@ -2276,12 +2485,12 @@ async function buildZip(templateBuffer, doc) {
   // 5) plan slide (items stamped at body_size - 1; original rPr kept)
   if (doc.plan !== null) {
     let planXml = await getXml(PLAN_SLIDE);
-    const planTitleBase = firstRpr(planXml, TITLE_MARKER);
-    doc.planTitleShown = doc.planTitle || planTitleText(planXml);
-    planXml = setBlockParas(planXml, TITLE_MARKER, titlePara(doc.planTitleShown, null, planTitleBase, doc.lang));
-    const planBodyBase = firstRpr(planXml, BODY_MARKER);
+    const planTitleBase = firstRpr(planXml, titleMarker);
+    doc.planTitleShown = doc.planTitle || planTitleText(planXml, kw);
+    planXml = setBlockParas(planXml, titleMarker, titlePara(doc.planTitleShown, null, planTitleBase, doc.lang));
+    const planBodyBase = firstRpr(planXml, bodyMarker);
     const planFix = listFixes(layoutBodyBlock(geo, await getXml(relsName(PLAN_SLIDE)), 1), masterXml);
-    planXml = setBlockParas(planXml, BODY_MARKER, doc.plan.map(function (t) {
+    planXml = setBlockParas(planXml, bodyMarker, doc.plan.map(function (t) {
       return tocPara(t[0], doc.TOC, planBodyBase, doc.lang, t[1], t[1] ? planFix.num[0] : ["", ""]);
     }).join(""));
     zip.file(PLAN_SLIDE, planXml);
@@ -2300,6 +2509,7 @@ async function buildZip(templateBuffer, doc) {
     tableStylesXml = await zip.file("ppt/tableStyles.xml").async("string");
   }
   const styleDefault = tableStyleId(tableStylesXml);
+  let themedTables = 0;
   const font = bodyFont(geo);
   const color = bodyColor(geo);
   const layouts = [];
@@ -2310,7 +2520,7 @@ async function buildZip(templateBuffer, doc) {
     const phs = plan.phs;
     let rels = contentRels;
     if (plan.file) {
-      x = x.replace(BODY_MARKER, function () { return phs[0].tag; });
+      x = x.replace(bodyMarker, function () { return phs[0].tag; });
       if (phs.length === 2) x = addBodyClone(x, phs[0].tag, phs[1].tag);
       for (const ph of phs) {
         if (ph.orphan) x = stampOrphan(x, ph.tag, ph.box, ph.block);
@@ -2319,8 +2529,8 @@ async function buildZip(templateBuffer, doc) {
         return 'Target="../slideLayouts/' + plan.file.split("/").pop() + '"';
       });
     }
-    const ctBase = firstRpr(x, TITLE_MARKER);
-    x = setBlockParas(x, TITLE_MARKER, titlePara(stitle || "", null, ctBase, doc.lang));
+    const ctBase = firstRpr(x, titleMarker);
+    x = setBlockParas(x, titleMarker, titlePara(stitle || "", null, ctBase, doc.lang));
     const flows = [], bases = [], slideLayouts = [];
     columns.forEach(function (items, ci) {
       const ph = phs[ci];
@@ -2353,8 +2563,18 @@ async function buildZip(templateBuffer, doc) {
           tno += 1;
           // a style without fills leaves the text colour to the slide, which
           // for a table is not the body text's
-          frames.push(tableFrameXml(obj, geom, TABLE_STYLES[obj.style] || styleDefault,
-            geom.pt, bases[fi], doc.lang, nid, tno, TABLE_STYLES[obj.style] ? color : ""));
+          let styleId = TABLE_STYLES[obj.style] || styleDefault;
+          let cellColor = TABLE_STYLES[obj.style] ? color : "";
+          if (doc.tableThemeFill && !styleHasFills(styleId, tableStylesXml)) {
+            // no cell would be coloured: use the default style, which takes
+            // its colours from the theme
+            styleId = styleHasFills(styleDefault, tableStylesXml) ? styleDefault : TABLE_STYLE_DEFAULT;
+            cellColor = "";
+            obj.themed = true;
+            themedTables += 1;
+          }
+          frames.push(tableFrameXml(obj, geom, styleId, geom.pt, bases[fi], doc.lang,
+            nid, tno, cellColor));
         } else {
           chartNo += 1;
           cno += 1;
@@ -2395,9 +2615,9 @@ async function buildZip(templateBuffer, doc) {
   // 7) closing slide (title stamped at the template's declared size)
   if (doc.closing !== null) {
     let closeXml = await getXml(CLOSE_SLIDE);
-    const closeSz = placeholderSz(closeXml, TITLE_MARKER) || TITLE_PT;
-    const closeBase = firstRpr(closeXml, TITLE_MARKER);
-    closeXml = setBlockParas(closeXml, TITLE_MARKER, titlePara(doc.closing, closeSz, closeBase, doc.lang));
+    const closeSz = placeholderSz(closeXml, titleMarker) || TITLE_PT;
+    const closeBase = firstRpr(closeXml, titleMarker);
+    closeXml = setBlockParas(closeXml, titleMarker, titlePara(doc.closing, closeSz, closeBase, doc.lang));
     zip.file(CLOSE_SLIDE, closeXml);
   }
 
@@ -2412,7 +2632,8 @@ async function buildZip(templateBuffer, doc) {
     if (zip.files[name] && zip.files[name].dir) delete zip.files[name];
   }
   setSlideSize(pres);
-  return { zip: zip, bodyPt: bodyPt, layouts: layouts, slideSize: [SLIDE_W, SLIDE_H] };
+  return { zip: zip, bodyPt: bodyPt, layouts: layouts, slideSize: [SLIDE_W, SLIDE_H],
+    themedTables: themedTables };
 }
 
 // The slide master and every layout as name -> XML text: the parts the
@@ -2485,6 +2706,10 @@ if (typeof module !== "undefined" && module.exports) {
     TABLE_URI: TABLE_URI, TABLE_STYLE_DEFAULT: TABLE_STYLE_DEFAULT,
     TABLE_GAP: TABLE_GAP, TABLE_CELL_PAD: TABLE_CELL_PAD,
     TABLE_MIN_COL_CHARS: TABLE_MIN_COL_CHARS,
+    DEFAULT_KEYWORDS: DEFAULT_KEYWORDS, parseAnchors: parseAnchors,
+    resolveKeywords: resolveKeywords, checkTemplateKeywords: checkTemplateKeywords,
+    FRONT_KEYS: FRONT_KEYS, frontMatter: frontMatter, parseSwitch: parseSwitch,
+    styleHasFills: styleHasFills,
     parseMd: parseMd, buildZip: buildZip, slideSpecs: slideSpecs
   };
 }
@@ -2508,6 +2733,55 @@ if (typeof module !== "undefined" && module.exports) {
     if (f) return await f.text();
     return $("mdtext").value;
   }
+
+  // ---------------- Settings ----------------
+  // The panel supplies defaults for the same settings the structure.md front
+  // matter takes (parseMd's `defaults`); a front matter value wins. The values
+  // are kept in localStorage, which may be unavailable, so every access is
+  // guarded and the panel works without it.
+  const SETTINGS_KEY = "md2pptx.settings";
+  const SETTING_FIELDS = { lang: "setLang", body_size: "setBody", topic_anchors: "setAnchors",
+    title_marker: "setTitleMarker", body_marker: "setBodyMarker" };
+
+  function readSettings() {
+    const out = {};
+    Object.keys(SETTING_FIELDS).forEach(function (key) {
+      const v = $(SETTING_FIELDS[key]).value.trim();
+      if (v) out[key] = v;
+    });
+    out.table_theme_fill = $("setTableFill").checked ? "on" : "off";
+    return out;
+  }
+
+  function showSettings(values) {
+    Object.keys(SETTING_FIELDS).forEach(function (key) {
+      $(SETTING_FIELDS[key]).value = values[key] || "";
+    });
+    $("setTableFill").checked = values.table_theme_fill !== "off";
+    $("kwBox").open = !!(values.topic_anchors || values.title_marker || values.body_marker);
+  }
+
+  function saveSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(readSettings())); } catch (e) { /* storage unavailable */ }
+  }
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) showSettings(JSON.parse(raw));
+    } catch (e) { /* storage unavailable or unreadable: keep the defaults */ }
+  }
+
+  Object.keys(SETTING_FIELDS).forEach(function (key) {
+    $(SETTING_FIELDS[key]).addEventListener("input", saveSettings);
+  });
+  $("setTableFill").addEventListener("change", saveSettings);
+  $("setReset").addEventListener("click", function () {
+    showSettings({});
+    saveSettings();
+    log("Settings reset to defaults.");
+  });
+  loadSettings();
 
   // Output file name: the deck topic, sanitized for all OSes and capped.
   function deckName(topic) {
@@ -2535,7 +2809,7 @@ if (typeof module !== "undefined" && module.exports) {
   // topic in the chat message.
   const PROMPT_TEXT =
     "FORMAT RULES\n" +
-    "- Front matter (optional): body_size: <pt> — baseline for plan items and table cells, which render at body_size - 1 pt; leave it out to use the template\'s own body size. Body text inherits the template font. lang: <BCP-47> (e.g. ru-RU) — stamps the proofing language on all generated text so PowerPoint does not flag it as misspelled.\n" +
+    "- Front matter (optional): body_size: <pt> — baseline for plan items and table cells, which render at body_size - 1 pt; leave it out to use the template\'s own body size. Write it between two --- lines at the very top of the file. Body text inherits the template font. lang: <BCP-47> (e.g. ru-RU) — stamps the proofing language on all generated text so PowerPoint does not flag it as misspelled.\n" +
     "- Sections, in presentation order: exactly one \"# title\"; at most one \"# plan\"; one or more \"# slide\"; at most one \"# closing\".\n" +
     "- # title: the topic text only (one line below the # title).\n" +
     "\n" +
@@ -2626,8 +2900,14 @@ if (typeof module !== "undefined" && module.exports) {
     try {
       const txt = await getStructureText();
       if (!txt.trim()) throw new Error("structure.md is empty");
-      const doc = parseMd(txt);
+      const settings = readSettings();
+      const doc = parseMd(txt, settings);
       if (!doc.slides.length) throw new Error("no '# slide' sections found");
+      const overridden = Object.keys(frontMatter(txt.split(/\r?\n/)).settings).filter(function (k) {
+        return settings[k] !== undefined && settings[k] !== "" &&
+          !(k === "table_theme_fill" && settings[k] === "on");
+      });
+      if (overridden.length) log("structure.md front matter overrides the panel: " + overridden.join(", "));
       const buf = await getTemplateBuffer();
       const built = await buildZip(buf, doc);
       const zip = built.zip;
@@ -2651,12 +2931,14 @@ if (typeof module !== "undefined" && module.exports) {
         " slides (body = template (est. " + bodyPt + " pt), plan items " + doc.TOC +
         " pt (body_size " + doc.bodySize + "), lang " +
         (doc.lang ? doc.lang + " (stamped, dirty=0)" : "not set") +
+        (built.themedTables ? "; " + built.themedTables + " table(s) given the theme-coloured default style" : "") +
         "). Downloaded.");
+      doc.warnings.forEach(function (w) { log("warning: " + w); });
 
       if ($("pdfCb").checked) {
         let scenes = null;
         try {
-          scenes = await templateScene(zip);
+          scenes = await templateScene(zip, doc.keywords);
         } catch (e) {
           log("Template scene parse failed (" + e.message + ") — plain preview.");
         }
@@ -3086,7 +3368,7 @@ if (typeof module !== "undefined" && module.exports) {
   // Parse slides 1-4 of the loaded template into per-slide scenes:
   // background, freeform shapes (master + layout + slide), placeholder
   // geometry (slide -> layout -> master) and placeholder text styles.
-  async function templateScene(zip) {
+  async function templateScene(zip, kw) {
     const theme = parseTheme(await zipText(zip, "ppt/theme/theme1.xml"));
     const fontFallback = theme.minorFont || "Times New Roman";
     // Paint for generated tables, resolved once per template from the theme palette and the
@@ -3239,8 +3521,12 @@ if (typeof module !== "undefined" && module.exports) {
           const text = sh.paras.map(function (p) {
             return p.runs.map(function (r) { return r.text; }).join("");
           }).join("");
-          if (text.indexOf(TITLE_ANCHOR_RU) >= 0) { sh.isTopic = true; sh.topicAnchor = "ru"; }
-          else if (text.indexOf(TITLE_ANCHOR_EN) >= 0) { sh.isTopic = true; sh.topicAnchor = "en"; }
+          for (const a of (kw || DEFAULT_KEYWORDS).topicAnchors) {
+            if (text.indexOf(a[0]) >= 0) {
+              sh.isTopic = true; sh.anchorText = a[0]; sh.keepAnchor = a[1];
+              break;
+            }
+          }
         }
       }
 
@@ -3460,8 +3746,8 @@ if (typeof module !== "undefined" && module.exports) {
     let paras = sh.paras;
     if (spec.kind === "title" && sh.isTopic) {
       const r0 = sh.paras[0] && sh.paras[0].runs[0];
-      const text = sh.topicAnchor === "ru"
-        ? TITLE_ANCHOR_RU + ": " + (spec.topic || "")
+      const text = sh.keepAnchor
+        ? sh.anchorText + ": " + (spec.topic || "")
         : (spec.topic || "");
       paras = [{ lvl: 0, algn: (sh.paras[0] && sh.paras[0].algn) || "l", marL: 0, indent: 0, bullet: null,
         runs: [{ text: text, bold: (r0 && r0.bold) || true,
@@ -3502,14 +3788,15 @@ if (typeof module !== "undefined" && module.exports) {
     };
     // `style: plain|grid` carry no fills; `grid` has rules; `header: off` and
     // `banded: off` drop the header fill and the band fills
-    const painted = tbl.style === "default";
+    // a fill-less table given the theme default by the engine is drawn painted
+    const painted = tbl.style === "default" || !!tbl.themed;
     if (painted && tbl.firstRow) fillRow(0, pal2.head);
     if (painted && tbl.banded) {
       for (let rr = tbl.firstRow ? 1 : 0; rr < nrows; rr++) {
         fillRow(rr, pal2.band[(rr - (tbl.firstRow ? 1 : 0)) % 2]);
       }
     }
-    const rule = tbl.style === "grid" ? "#7f7f7f" : (painted ? pal2.line : null);
+    const rule = tbl.style === "grid" && !tbl.themed ? "#7f7f7f" : (painted ? pal2.line : null);
     if (rule) {
       // one rectangle per cell range, so no rule runs through a merged cell
       ctx.strokeStyle = rule;

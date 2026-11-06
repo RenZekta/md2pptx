@@ -116,16 +116,89 @@ TITLE_ANCHOR_EN = "Topic"           # English title-slide topic-line anchor
 TITLE_MARKER = '<p:ph type="title"/>'   # title placeholder
 BODY_MARKER = '<p:ph idx="1"/>'       # body placeholder
 
+# Template keywords: the strings the engine looks for in the template's own
+# slides. `topic_anchors` are tried in order against the title slide; the one
+# found marks the topic line, and `keep` says whether the anchor stays in front
+# of the topic ("На тему: <topic>") or the line is replaced by the topic alone.
+# The markers are literal substrings of the placeholder tags in the slide XML.
+DEFAULT_KEYWORDS = {
+    "topic_anchors": [(TITLE_ANCHOR_RU, True), (TITLE_ANCHOR_EN, False)],
+    "title_marker": TITLE_MARKER,
+    "body_marker": BODY_MARKER,
+}
 
-def topic_anchor(title_xml):
-    """Anchor present in the title slide: Russian first, then English;
-    raises when neither is found."""
-    if TITLE_ANCHOR_RU in title_xml:
-        return TITLE_ANCHOR_RU
-    if TITLE_ANCHOR_EN in title_xml:
-        return TITLE_ANCHOR_EN
-    raise SystemExit("ERROR: no title-slide topic anchor found (expected "
-                     "%r or %r)" % (TITLE_ANCHOR_RU, TITLE_ANCHOR_EN))
+
+def parse_anchors(text):
+    """[(anchor, keep)] from a comma-separated list. An entry ending in
+    `(keep)` keeps its anchor as a prefix of the topic line; entries are
+    trimmed and empty ones dropped."""
+    out = []
+    for raw in text.split(","):
+        item = raw.strip()
+        keep = False
+        m = re.match(r"^(.*?)\s*\(keep\)$", item, re.I)
+        if m:
+            item, keep = m.group(1).strip(), True
+        if item:
+            out.append((item, keep))
+    return out
+
+
+def resolve_keywords(settings=None):
+    """The template keywords: DEFAULT_KEYWORDS with the `topic_anchors`,
+    `title_marker` and `body_marker` entries of `settings` applied. Blank
+    values keep the default; a marker must be a `<p:ph .../>` tag."""
+    s = settings or {}
+    kw = {"topic_anchors": list(DEFAULT_KEYWORDS["topic_anchors"]),
+          "title_marker": DEFAULT_KEYWORDS["title_marker"],
+          "body_marker": DEFAULT_KEYWORDS["body_marker"]}
+    anchors = parse_anchors(s.get("topic_anchors", "") or "")
+    if anchors:
+        kw["topic_anchors"] = anchors
+    for key in ("title_marker", "body_marker"):
+        v = (s.get(key, "") or "").strip()
+        if v:
+            if not re.match(r"^<p:ph\b[^<>]*/?>$", v):
+                raise SystemExit(
+                    "ERROR: %s %r is not a placeholder tag (expected "
+                    "something like <p:ph type=\"title\"/>)" % (key, v))
+            kw[key] = v
+    return kw
+
+
+def topic_anchor(title_xml, kw=None):
+    """(anchor, keep) of the first topic anchor present in the title slide;
+    raises when none is found."""
+    anchors = (kw or DEFAULT_KEYWORDS)["topic_anchors"]
+    for text, keep in anchors:
+        if text in title_xml:
+            return text, keep
+    raise SystemExit("ERROR: no title-slide topic anchor found (expected %s)"
+                     % " or ".join(repr(a) for a, _k in anchors))
+
+
+def check_template_keywords(parts, kw, need_plan, need_closing):
+    """Fail early, naming the setting to change, when a template slide lacks
+    the keyword the engine needs from it."""
+    tm, bm = kw["title_marker"], kw["body_marker"]
+    need = [(TITLE_SLIDE, "title slide", None),
+            (CONTENT_SLIDE, "content slide (slide3)", (tm, bm))]
+    if need_plan:
+        need.append((PLAN_SLIDE, "plan slide (slide2)", (tm, bm)))
+    if need_closing:
+        need.append((CLOSE_SLIDE, "closing slide (slide4)", (tm,)))
+    for name, label, markers in need:
+        xml = parts[name].decode("utf-8")
+        if markers is None:
+            topic_anchor(xml, kw)
+            continue
+        for m in markers:
+            if m not in xml:
+                key = "title_marker" if m == tm else "body_marker"
+                raise SystemExit(
+                    "ERROR: the template's %s has no placeholder matching "
+                    "%s %r; set %s to the placeholder tag it uses"
+                    % (label, key, m, key))
 
 
 TITLE_PT = 36                        # fallback closing-slide title size
@@ -889,12 +962,13 @@ def layout_body_block(parts, rels_xml, idx):
     return None
 
 
-def default_body(parts, content_xml, content_rels):
+def default_body(parts, content_xml, content_rels, kw=None):
     """(box, layout block) of the clone prototype's body placeholder. The box
     is the slide's own geometry, else its layout's, else the master's; the
     block is the layout's placeholder (None without one)."""
+    body_marker = (kw or DEFAULT_KEYWORDS)["body_marker"]
     block = layout_body_block(parts, content_rels, 1)
-    box = sp_box(sp_block(content_xml, BODY_MARKER)) or sp_box(block)
+    box = sp_box(sp_block(content_xml, body_marker)) or sp_box(block)
     return box or master_body_box(parts), block
 
 
@@ -921,7 +995,7 @@ def is_two_content(entry, master_box):
     return a[1] == b[1] and a[0] + a[2] <= b[0]
 
 
-def plan_slide(parts, default, body_pt, layout_key, ncols):
+def plan_slide(parts, default, body_pt, layout_key, ncols, kw=None):
     """Where a slide's columns go: {"file": layout part or None for the clone
     prototype's own layout, "phs": one dict per column}. A column dict has:
 
@@ -939,7 +1013,8 @@ def plan_slide(parts, default, body_pt, layout_key, ncols):
     `spacing`, effective_spacing() at the column's size."""
     master_xml = parts[MASTER].decode("utf-8") if MASTER in parts else ""
     if layout_key is None and ncols == 1:
-        return {"file": None, "phs": [{"tag": BODY_MARKER, "box": default[0],
+        return {"file": None, "phs": [{"tag": (kw or DEFAULT_KEYWORDS)["body_marker"],
+                                       "box": default[0],
                                        "pt": body_pt, "block": default[1],
                                        "orphan": False,
                                        "spacing": effective_spacing(default[1], master_xml, body_pt)}]}
@@ -1447,6 +1522,18 @@ def table_style_id(table_styles_xml):
     return m.group(1) if m else TABLE_STYLE_DEFAULT
 
 
+def style_has_fills(style_id, table_styles_xml):
+    """Whether the table style paints any cell fill. The two built-in "No
+    Style" GUIDs never do; a style the template defines does when its XML
+    holds an <a:fill>; any other GUID is a built-in PowerPoint resolves
+    itself and is taken to colour its cells."""
+    if style_id in (TABLE_STYLES["plain"], TABLE_STYLES["grid"]):
+        return False
+    m = re.search(r'<a:tblStyle\b[^>]*\bstyleId="%s".*?</a:tblStyle>'
+                  % re.escape(style_id), table_styles_xml, re.S)
+    return "<a:fill>" in m.group(0) if m else True
+
+
 # ----------------------------- slide surgery ---------------------------------
 def remove_sp(xml, marker):
     """Drop the <p:sp> containing `marker` (an empty body placeholder; an
@@ -1579,33 +1666,91 @@ def parse_slide(body):
     return (title, [parse_column(l) for _n, l in blocks], layout)
 
 
-def parse_md(text):
-    lines = text.splitlines()
+FRONT_KEYS = ("body_size", "lang", "table_theme_fill", "topic_anchors",
+              "title_marker", "body_marker")
+
+
+def parse_switch(text, key):
+    """True / False from an on-off setting (on, off, true, false, yes, no,
+    1, 0); anything else raises."""
+    t = (text or "").strip().lower()
+    if t in ("on", "true", "yes", "1"):
+        return True
+    if t in ("off", "false", "no", "0"):
+        return False
+    raise SystemExit("ERROR: %s expects on or off, got %r" % (key, text))
+
+
+def front_matter(lines):
+    """Read the settings block at the top of structure.md.
+
+    Returns (settings, start, warnings): `settings` maps setting names to
+    their text, `start` is the index of the first line after the block. The
+    block is the `---` fenced one or, without a fence, the `key: value` lines
+    before the first `# ` heading; a byte-order mark and blank lines in front
+    of it are skipped. Unknown keys and stray text are reported in `warnings`
+    instead of being dropped silently.
+    """
     n = len(lines)
+    settings, warnings = {}, []
+
+    def take(line):
+        line = line.lstrip("\ufeff")
+        if not line.strip():
+            return
+        key, sep, value = line.partition(":")
+        key = key.strip().lower().replace("-", "_")
+        if not sep or not re.match(r"^[a-z_][a-z0-9_]*$", key):
+            warnings.append("ignored text before the first section: %r"
+                            % line.strip()[:60])
+        elif key not in FRONT_KEYS:
+            warnings.append("unknown setting %r ignored (known: %s)"
+                            % (key, ", ".join(FRONT_KEYS)))
+        else:
+            settings[key] = value.strip()
+
     i = 0
-    body_size = None
-    lang = None
-    if n and lines[0].strip() == "---":
-        i = 1
-        fm = {}
+    while i < n and not lines[i].lstrip("\ufeff").strip():
+        i += 1
+    if i < n and lines[i].lstrip("\ufeff").strip() == "---":
+        i += 1
         while i < n and lines[i].strip() != "---":
-            if ":" in lines[i]:
-                k, v = lines[i].split(":", 1)
-                fm[k.strip()] = v.strip()
+            take(lines[i])
             i += 1
-        if i < n:
-            i += 1
+        return settings, (i + 1 if i < n else i), warnings
+    while i < n and not lines[i].startswith("# "):
+        take(lines[i])
+        i += 1
+    return settings, i, warnings
+
+
+def parse_md(text, defaults=None):
+    """Parse structure.md into the doc dict build() consumes. `defaults`
+    holds the same settings as the front matter (from the command line or the
+    web app); a setting written in the front matter wins over it."""
+    lines = text.splitlines()
+    fm, i, warnings = front_matter(lines)
+    settings = {k: str(v).strip() for k, v in (defaults or {}).items()
+                if k in FRONT_KEYS and str(v).strip()}
+    settings.update({k: v for k, v in fm.items() if v})
+    body_size = None
+    if "body_size" in settings:
         try:
-            body_size = int(fm["body_size"]) if "body_size" in fm else None
+            body_size = int(settings["body_size"])
         except ValueError:
-            body_size = None
-        lang_in = fm.get("lang", "").strip()
-        if lang_in:
-            if not re.match(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$", lang_in):
-                raise SystemExit(
-                    "ERROR: invalid lang %r in structure.md front matter "
-                    "(expected a BCP-47 tag like ru-RU)" % lang_in)
-            lang = lang_in
+            warnings.append("body_size %r is not a whole number; ignored"
+                            % settings["body_size"])
+    lang = None
+    lang_in = settings.get("lang", "")
+    if lang_in:
+        if not re.match(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$", lang_in):
+            raise SystemExit(
+                "ERROR: invalid lang %r (expected a BCP-47 tag like ru-RU)"
+                % lang_in)
+        lang = lang_in
+    table_theme_fill = parse_switch(settings.get("table_theme_fill", "on"),
+                                    "table_theme_fill")
+    keywords = resolve_keywords(settings)
     # body_size drives the plan slide (items at body_size - 1), the table
     # cells (also body_size - 1: a table has no placeholder to inherit a size
     # from) and the default chart text size; without it the template's own
@@ -1627,7 +1772,8 @@ def parse_md(text):
         sections.append(cur)
 
     doc = {"body_size": body_size, "TOC": TOC, "table_pt": TOC, "lang": lang,
-           "title": None, "plan": None, "plan_title": None, "slides": [],
+           "table_theme_fill": table_theme_fill, "keywords": keywords,
+           "warnings": warnings, "title": None, "plan": None, "plan_title": None, "slides": [],
            "closing": None}
     for header, body in sections:
         if header == "title":
@@ -1652,11 +1798,11 @@ def parse_md(text):
 
 
 # ----------------------------- template font -------------------------------
-def resolve_body_size(parts):
+def resolve_body_size(parts, kw=None):
     """Effective body font size in points of the template's content slide:
     slide3 body placeholder -> its slide layout -> OOXML default 18 pt."""
     xml = parts[CONTENT_SLIDE].decode("utf-8")
-    sz = placeholder_sz(xml, BODY_MARKER)
+    sz = placeholder_sz(xml, (kw or DEFAULT_KEYWORDS)["body_marker"])
     if sz:
         return sz
     rels = parts[CONTENT_RELS].decode("utf-8")
@@ -1711,17 +1857,19 @@ def package_slots(parts, pres, pres_rels):
             max(files + [4]) + 1)
 
 
-def plan_title_text(plan_xml):
+def plan_title_text(plan_xml, kw=None):
     """The plan slide's title as the template has it, minus a trailing
     parenthesised remark (a template hint such as "Plan (if any)")."""
-    block = sp_block(plan_xml, TITLE_MARKER) or ""
+    block = sp_block(plan_xml, (kw or DEFAULT_KEYWORDS)["title_marker"]) or ""
     text = unesc("".join(re.findall(r"<a:t>([^<]*)</a:t>", block))).strip()
     return re.sub(r"\s*\([^()]*\)\s*$", "", text).strip() or "Plan"
 
 
 # ----------------------------- engine ---------------------------------------
-def build(structure_text, template_path, out_path):
-    doc = parse_md(structure_text)
+def build(structure_text, template_path, out_path, settings=None):
+    doc = parse_md(structure_text, settings)
+    kw = doc["keywords"]
+    title_marker, body_marker = kw["title_marker"], kw["body_marker"]
     n = len(doc["slides"])
     if n < 1:
         raise SystemExit("ERROR: no '# slide' sections found in structure.md")
@@ -1734,7 +1882,9 @@ def build(structure_text, template_path, out_path):
     ct = parts["[Content_Types].xml"].decode("utf-8")
     content_xml = parts[CONTENT_SLIDE].decode("utf-8")
     content_rels = parts[CONTENT_RELS].decode("utf-8")
-    body_pt = resolve_body_size(parts)
+    check_template_keywords(parts, kw, doc["plan"] is not None,
+                            doc["closing"] is not None)
+    body_pt = resolve_body_size(parts, kw)
     if doc["body_size"] is None:
         doc["body_size"] = body_pt
         doc["TOC"] = doc["table_pt"] = body_pt - 1
@@ -1743,8 +1893,8 @@ def build(structure_text, template_path, out_path):
 
     # Where each slide's columns go (layout file, placeholder tags, boxes).
     # Resolved before anything is written so a bad layout fails early.
-    default = default_body(parts, content_xml, content_rels)
-    plans = [plan_slide(parts, default, body_pt, layout_key, len(columns))
+    default = default_body(parts, content_xml, content_rels, kw)
+    plans = [plan_slide(parts, default, body_pt, layout_key, len(columns), kw)
              for _t, columns, layout_key in doc["slides"]]
     doc["geom"] = [[(ph["box"], ph["pt"], ph["spacing"]) for ph in plan["phs"]]
                    for plan in plans]
@@ -1789,14 +1939,13 @@ def build(structure_text, template_path, out_path):
     TOC = doc["TOC"]
 
     # 4) fill the title slide (topic line; bold, size inherited from the
-    #    template; font of the original anchor run is kept). Russian standard:
-    #    with the RU anchor the engine keeps the "На тему: <тема>" format by
-    #    prepending "На тему: "; with the EN anchor the whole line is
-    #    replaced by the topic.
+    #    template; font of the original anchor run is kept). An anchor
+    #    marked `keep` stays in front of the topic ("На тему: <тема>"); any
+    #    other anchor's whole line is replaced by the topic.
     title_xml = parts[TITLE_SLIDE].decode("utf-8")
     topic = doc["title"] or ""
-    anchor = topic_anchor(title_xml)
-    topic_text = (anchor + ": " + topic) if anchor == TITLE_ANCHOR_RU else topic
+    anchor, keep_anchor = topic_anchor(title_xml, kw)
+    topic_text = (anchor + ": " + topic) if keep_anchor else topic
     topic_base = first_rpr(title_xml, anchor)
     topic_para = ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
                   % (merge_rpr(topic_base, (True, False, False), None, doc["lang"]),
@@ -1807,16 +1956,16 @@ def build(structure_text, template_path, out_path):
     # 5) fill the plan slide (items stamped at body_size - 1)
     if doc["plan"] is not None:
         plan_xml = parts[PLAN_SLIDE].decode("utf-8")
-        plan_title_base = first_rpr(plan_xml, TITLE_MARKER)
+        plan_title_base = first_rpr(plan_xml, title_marker)
         plan_xml = set_block_paras(
-            plan_xml, TITLE_MARKER,
-            title_para(doc["plan_title"] or plan_title_text(plan_xml),
+            plan_xml, title_marker,
+            title_para(doc["plan_title"] or plan_title_text(plan_xml, kw),
                        base=plan_title_base, lang=doc["lang"]))
-        plan_body_base = first_rpr(plan_xml, BODY_MARKER)
+        plan_body_base = first_rpr(plan_xml, body_marker)
         plan_fix = list_fixes(
             layout_body_block(parts, parts[rels_name(PLAN_SLIDE)].decode("utf-8"), 1),
             master_xml)
-        plan_xml = set_block_paras(plan_xml, BODY_MARKER,
+        plan_xml = set_block_paras(plan_xml, body_marker,
                                   "".join(toc_para(t, TOC, base=plan_body_base,
                                                  lang=doc["lang"], num=num,
                                                  add=plan_fix["num"][0] if num else ("", ""))
@@ -1831,8 +1980,9 @@ def build(structure_text, template_path, out_path):
     #    the size column_flow chose, charts wired to a chart part, its
     #    embedded workbook and a slide relationship.
     content_order = [CONTENT_SLIDE] + [fn for fn, _sid, _rid in clones]
-    style_default = table_style_id(
-        parts.get("ppt/tableStyles.xml", b"").decode("utf-8", "ignore"))
+    table_styles_xml = parts.get("ppt/tableStyles.xml", b"").decode("utf-8", "ignore")
+    style_default = table_style_id(table_styles_xml)
+    themed_tables = 0
     font = body_font(parts)
     color = body_color(parts)
     chart_no = 0
@@ -1842,7 +1992,7 @@ def build(structure_text, template_path, out_path):
         phs = plan["phs"]
         rels = content_rels
         if plan["file"]:
-            x = x.replace(BODY_MARKER, phs[0]["tag"], 1)
+            x = x.replace(body_marker, phs[0]["tag"], 1)
             if len(phs) == 2:
                 x = add_body_clone(x, phs[0]["tag"], phs[1]["tag"])
             for ph in phs:
@@ -1851,8 +2001,8 @@ def build(structure_text, template_path, out_path):
             rels = re.sub(r'Target="\.\./slideLayouts/slideLayout[0-9]+\.xml"',
                           'Target="../slideLayouts/%s"' % plan["file"].split("/")[-1],
                           rels, 1)
-        ct_base = first_rpr(x, TITLE_MARKER)
-        x = set_block_paras(x, TITLE_MARKER,
+        ct_base = first_rpr(x, title_marker)
+        x = set_block_paras(x, title_marker,
                            title_para(stitle or "", base=ct_base,
                                      lang=doc["lang"]))
         flows, bases = [], []
@@ -1881,10 +2031,20 @@ def build(structure_text, template_path, out_path):
                     tno += 1
                     # a style without fills leaves the text colour to the
                     # slide, which for a table is not the body text's
+                    style_id = TABLE_STYLES[obj["style"]] or style_default
+                    cell_color = color if TABLE_STYLES[obj["style"]] else ""
+                    if doc["table_theme_fill"] and not style_has_fills(
+                            style_id, table_styles_xml):
+                        # no cell would be coloured: use the default style,
+                        # which takes its colours from the theme
+                        style_id = (style_default if style_has_fills(
+                            style_default, table_styles_xml)
+                            else TABLE_STYLE_DEFAULT)
+                        cell_color = ""
+                        themed_tables += 1
                     frames.append(table_frame_xml(
-                        obj, geom, TABLE_STYLES[obj["style"]] or style_default,
-                        geom["pt"], base, doc["lang"], nid, tno,
-                        color if TABLE_STYLES[obj["style"]] else ""))
+                        obj, geom, style_id, geom["pt"], base, doc["lang"],
+                        nid, tno, cell_color))
                 else:
                     chart_no += 1
                     cno += 1
@@ -1926,9 +2086,9 @@ def build(structure_text, template_path, out_path):
     # 7) fill the closing slide (title stamped at the template's declared size)
     if doc["closing"] is not None:
         close_xml = parts[CLOSE_SLIDE].decode("utf-8")
-        close_sz = placeholder_sz(close_xml, TITLE_MARKER) or TITLE_PT
-        close_base = first_rpr(close_xml, TITLE_MARKER)
-        close_xml = set_block_paras(close_xml, TITLE_MARKER,
+        close_sz = placeholder_sz(close_xml, title_marker) or TITLE_PT
+        close_base = first_rpr(close_xml, title_marker)
+        close_xml = set_block_paras(close_xml, title_marker,
                                     title_para(doc["closing"], sz=close_sz,
                                               base=close_base,
                                               lang=doc["lang"]))
@@ -1949,6 +2109,7 @@ def build(structure_text, template_path, out_path):
                 continue
             z.writestr(name, parts[name])
 
+    doc["themed_tables"] = themed_tables
     return doc, len(content_order), body_pt
 
 
@@ -2030,15 +2191,55 @@ def validate(out_path):
 
 
 # ----------------------------- main -----------------------------------------
+def parse_cli(argv):
+    """(struct_path, template_path, out_path, settings) from the command
+    line, or None when the arguments are not usable. The options mirror the
+    structure.md front matter and are only defaults: a setting written in the
+    file wins."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="engine.py", add_help=True,
+        description="Build a .pptx from structure.md and a template.")
+    ap.add_argument("structure")
+    ap.add_argument("template")
+    ap.add_argument("output")
+    ap.add_argument("--lang", help="BCP-47 proofing language, e.g. ru-RU")
+    ap.add_argument("--body-size", help="body size in points (plan items, "
+                    "table cells and chart text use size - 1)")
+    ap.add_argument("--table-theme-fill", choices=("on", "off"), default=None,
+                    help="give tables that would have no coloured cell the "
+                    "default theme-coloured style (default: on)")
+    ap.add_argument("--topic-anchors", help="title-slide topic anchors, comma "
+                    "separated; `(keep)` after one keeps it as a prefix "
+                    "(default: 'На тему (keep), Topic')")
+    ap.add_argument("--title-marker", help="title placeholder tag, e.g. "
+                    "'<p:ph type=\"title\"/>'")
+    ap.add_argument("--body-marker", help="body placeholder tag, e.g. "
+                    "'<p:ph idx=\"1\"/>'")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as e:
+        return None if e.code else "help"
+    settings = {"lang": a.lang, "body_size": a.body_size,
+                "table_theme_fill": a.table_theme_fill,
+                "topic_anchors": a.topic_anchors,
+                "title_marker": a.title_marker, "body_marker": a.body_marker}
+    return (a.structure, a.template, a.output,
+            {k: v for k, v in settings.items() if v})
+
+
 def main():
-    if len(sys.argv) != 4:
-        print("usage: python engine.py <structure.md> <template.pptx> <output.pptx>")
+    cli = parse_cli(sys.argv[1:])
+    if cli == "help":
+        return 0
+    if cli is None:
         return 2
-    struct_path, template_path, out_path = sys.argv[1:4]
-    with open(struct_path, "r", encoding="utf-8") as f:
+    struct_path, template_path, out_path, settings = cli
+    with open(struct_path, "r", encoding="utf-8-sig") as f:
         structure_text = f.read()
 
-    doc, ncontent, body_pt = build(structure_text, template_path, out_path)
+    doc, ncontent, body_pt = build(structure_text, template_path, out_path,
+                                   settings)
     problems = validate(out_path)
     over = fit_check(doc)
 
@@ -2055,13 +2256,18 @@ def main():
     n_tables = sum(1 for it in items if it[0] == "table")
     n_charts = sum(1 for it in items if it[0] == "chart")
     n_cols = sum(1 for _t, columns, _lk in doc["slides"] if len(columns) == 2)
-    print("  tables: %d (cells at %d pt)" % (n_tables, doc["table_pt"]))
+    print("  tables: %d (cells at %d pt%s)"
+          % (n_tables, doc["table_pt"],
+             ("; %d given the theme-coloured default style"
+              % doc["themed_tables"]) if doc["themed_tables"] else ""))
     if n_charts:
         print("  charts: %d" % n_charts)
     if n_cols:
         print("  two-column slides: %d" % n_cols)
     print("  lang: %s" % ((doc["lang"] + " (stamped, dirty=0)") if doc["lang"]
                            else "not set (template default)"))
+    for w in doc["warnings"]:
+        print("  warning: " + w)
     if problems:
         print("VALIDATION FAILED:")
         for p in problems:

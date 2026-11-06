@@ -41,11 +41,23 @@ into a chat model *with* guidance instead of as a bare file. The model's only
 role is *learning the conventions* — producing a well-formed `structure.md`;
 the parser enforces the format deterministically.
 
+A **Settings** card holds the same options as the `structure.md` front matter —
+proofing language, body size, the table theme-fill switch and, under *Template
+keywords*, the topic anchors and the title and body placeholder tags — as
+defaults for every build. They are kept in the browser (`localStorage`), and a
+value written in the `structure.md` front matter wins over them; the log says
+which ones it overrode. *Reset to defaults* clears them.
+
 ## The `structure.md` format (the contract)
 
 A single source of truth. The engine reads it and produces the deck.
 
-**Front matter** (optional keys in a leading block):
+**Front matter** (optional keys in a leading block, written between two `---`
+lines). The engine also reads the keys when the fences are missing (`key: value`
+lines before the first `# ` heading), and tolerates a byte-order mark or blank
+lines at the top of the file; an unknown key or stray text there is reported as
+a warning rather than ignored silently. Every key can also be given as a default
+(command-line option, web-app Settings panel); a value in the front matter wins.
 - `body_size: <pt>` — baseline font size for the plan-slide items and the
   table cells (both at `body_size - 1` pt). Without it the template's own body
   size is used (read from the content slide's body placeholder: 18 pt in the
@@ -57,6 +69,22 @@ A single source of truth. The engine reads it and produces the deck.
   default language (English), flagging non-English text as "misspelled"; with
   it, every generated run and paragraph end mark gets `lang="<tag>"`
   `dirty="0"` (the same stamp PowerPoint puts on pasted runs).
+- `table_theme_fill: on|off` (default `on`) — a table whose style paints no
+  cell (`style: plain` or `grid`, or a template whose default table style has no
+  fills) is given the template's default table style instead, so its colours come
+  from the theme: an accent-coloured header row and filled body rows. `off` keeps
+  such tables as written. Command line: `--table-theme-fill on|off`.
+- `topic_anchors: <text>[ (keep)], ...` (default `На тему (keep), Topic`) — the
+  text on the title slide that marks the topic line, tried in order. `(keep)`
+  keeps the anchor in front of the topic (`На тему: <тема>`); any other anchor's
+  whole line is replaced by the topic. Command line: `--topic-anchors`.
+- `title_marker: <tag>` (default `<p:ph type="title"/>`) and `body_marker: <tag>`
+  (default `<p:ph idx="1"/>`) — the placeholder tags, as written in the
+  template's slide XML, that identify the title and the body on the plan,
+  content and closing slides. Set them when a custom template's placeholders
+  carry other attributes (for example `<p:ph type="body" idx="1"/>`). The
+  engine stops with a message naming the setting when a slide has no match.
+  Command line: `--title-marker`, `--body-marker`.
 
 The template is **not** part of `structure.md` — it is supplied to the engine
 separately (a tool-call argument in the skill, a file input in the web app), so
@@ -111,7 +139,9 @@ the `.md` stays portable across templates.
   - `first-col: on` — the table style's first-column formatting.
   - `banded: off` — no alternating row shading.
   - `style: default|plain|grid` — the template's default table style, no style
-    (no fills, no rules), or no fills with a table grid.
+    (no fills, no rules), or no fills with a table grid. With `table_theme_fill`
+    on (the default) `plain` and `grid` give way to the theme-coloured default
+    style; set `table_theme_fill: off` to keep them.
 - Merged cells: a cell that is exactly `<<` joins the cell to its left, `^^`
   the cell above; a `<<` under a `^^` joins the same block. The range shows the
   content of its top-left cell. A marker with nothing to join (first column or
@@ -164,7 +194,7 @@ md2pptx/
     ├── test_structure.md    # shared sample outline (exercises all features)
     ├── test_numbering.md    # shared outline for numbered-list runs
     ├── test_structure_en.md # outline built against English-Template.pptx
-    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts, inline marks, tables, layouts, charts, lang, both templates)
+    ├── run_tests.py         # Python engine tests (anchors, numbering, fonts, inline marks, tables, layouts, charts, lang, settings, both templates)
     ├── run_tests_js.js      # JS engine tests + byte-parity vs Python (same coverage)
     └── out/                 # build artifacts (regenerated on each run)
 ```

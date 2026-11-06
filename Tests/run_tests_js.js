@@ -348,9 +348,10 @@ async function partsDiff(za, zb) {
       j(["2743200", "1828800", "1828800", "1828800"]));
     check("table options: size 15 stamped on every cell run",
       j([...new Set([...s7.matchAll(/<a:rPr[^>]* sz="(\d+)"/g)].map((m) => m[1]))]) === j(["1500"]));
-    check("table options: firstRow + firstCol + bandRow, grid style",
+    check("table options: firstRow + firstCol + bandRow; a grid table with no coloured cell gets the theme default style",
       s7.includes('<a:tblPr firstRow="1" firstCol="1" bandRow="1">') &&
-      s7.includes("{5940675A-B579-460E-94D1-54222C63F5DA}"));
+      s7.includes("{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}") &&
+      !s7.includes("{5940675A-B579-460E-94D1-54222C63F5DA}"));
     check("merged cells: one colspan, three rowspans, covered cells flagged",
       cnt(s7, /gridSpan="2"/g) === 1 && cnt(s7, /rowSpan="2"/g) === 3 &&
       cnt(s7, /hMerge="1"/g) === 1 && cnt(s7, /vMerge="1"/g) === 3);
@@ -533,8 +534,8 @@ async function partsDiff(za, zb) {
     const ce = await part(ez, "ppt/charts/chart1.xml");
     check("chart text takes the master's body colour and typeface",
       ce.includes('<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="Poppins"/>'));
-    check("cells of a fill-less table style carry the body text colour",
-      cnt(await xe(7), /<a:solidFill><a:srgbClr val="FFFFFF"\/><\/a:solidFill>/g) >= 6);
+    check("a fill-less style given the theme default leaves the cell text colour to the style",
+      !(await xe(7)).split("<a:tbl>")[1].includes("<a:solidFill>"));
     check("the default table style keeps its own cell colours",
       !(await xe(9)).split("<a:tbl>")[1].includes("<a:solidFill>"));
 
@@ -560,6 +561,143 @@ async function partsDiff(za, zb) {
     threw = /invalid lang/.test(e.message);
   }
   check("invalid lang raises", threw);
+
+
+  // ---- [8] settings: tolerant front matter, table theme fill, template keywords
+  console.log("[8] settings: tolerant front matter, table theme fill, template keywords");
+  const cnt = (x, re) => (x.match(re) || []).length;
+  const buildWith = async (text, tpl, defaults) => {
+    const d = api.parseMd(text, defaults);
+    const built = await api.buildZip(tpl, d);
+    return { d, built, z: built.zip };
+  };
+  const slideNames = (z2) => Object.keys(z2.files)
+    .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+    .sort((a, b) => parseInt(a.match(/\d+/)[0], 10) - parseInt(b.match(/\d+/)[0], 10));
+  const tableSlides = async (z2) => {
+    const out = [];
+    for (const n of slideNames(z2)) {
+      const x = await z2.file(n).async("string");
+      if (x.includes("<a:tbl>")) out.push(x);
+    }
+    return out;
+  };
+  const unstamped = async (z2) => {
+    let c = 0;
+    for (const n of slideNames(z2)) {
+      if (!/slide[3-9]\.xml$/.test(n)) continue;
+      c += ((await z2.file(n).async("string")).match(/<a:r><a:rPr(?![^>]*lang=)/g) || []).length;
+    }
+    return c;
+  };
+  const body8 = "# title\nT\n\n# slide\n\n## H\n\nПривет, мир\n";
+  for (const [label, head] of [["no fence", "body_size: 18  \nlang: ru-RU\n\n"],
+    ["fence", "---\nbody_size: 18\nlang: ru-RU\n---\n\n"],
+    ["byte-order mark", "\uFEFF---\nlang: ru-RU\n---\n"],
+    ["blank lines first", "\n\n---\nlang: ru-RU\n---\n"]]) {
+    const r = await buildWith(head + body8, tplBuf);
+    check("front matter (" + label + "): lang declared", r.d.lang === "ru-RU", String(r.d.lang));
+    check("front matter (" + label + "): every content-slide run stamped",
+      (await unstamped(r.z)) === 0, String(await unstamped(r.z)));
+  }
+  let r8 = await buildWith(body8, tplBuf);
+  check("without a lang the content slide runs are left unstamped",
+    r8.d.lang === null && (await unstamped(r8.z)) > 0);
+  r8 = await buildWith("---\nlang: de-DE\n---\n" + body8, tplBuf, { lang: "ru-RU", body_size: "20" });
+  check("a front matter setting wins over the defaults passed in",
+    r8.d.lang === "de-DE" && r8.d.bodySize === 20, j([r8.d.lang, r8.d.bodySize]));
+  r8 = await buildWith(body8, tplBuf, { lang: "ru-RU" });
+  check("defaults apply when the file declares nothing", r8.d.lang === "ru-RU");
+  let d8 = api.parseMd("---\nlnag: ru-RU\nlang: ru-RU\n---\n" + body8);
+  check("an unknown front matter key is reported, the valid one kept",
+    d8.lang === "ru-RU" && d8.warnings.some((w) => w.includes("lnag")), j(d8.warnings));
+  d8 = api.parseMd("Some intro line\nlang: ru-RU\n\n" + body8);
+  check("stray text before the first section is reported",
+    d8.lang === "ru-RU" && d8.warnings.some((w) => w.includes("Some intro")), j(d8.warnings));
+  let threw8 = "";
+  try { api.parseMd("---\ntable_theme_fill: maybe\n---\n" + body8); } catch (e) { threw8 = String(e.message); }
+  check("an invalid table_theme_fill raises", threw8.includes("table_theme_fill"), threw8);
+
+  const grid8 = "# title\nT\n\n# slide\n\n## H\n\n{style: grid}\n\n| A | B |\n| - | - |\n| 1 | 2 |\n" +
+    "\n# slide\n\n## H2\n\n{style: plain}\n\n| A | B |\n| - | - |\n| 1 | 2 |\n" +
+    "\n# slide\n\n## H3\n\n| A | B |\n| - | - |\n| 1 | 2 |\n";
+  const GRID_ID = "{5940675A-B579-460E-94D1-54222C63F5DA}", PLAIN_ID = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}";
+  r8 = await buildWith(grid8, tplBuf);
+  let ts = await tableSlides(r8.z);
+  check("table theme fill is on by default",
+    r8.d.tableThemeFill === true && r8.built.themedTables === 2, String(r8.built.themedTables));
+  check("grid and plain tables with no coloured cell take the theme default style",
+    ts.length === 3 && ts.every((x) => x.includes("<a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId>")));
+  check("the themed tables keep the header and banding flags",
+    ts.every((x) => x.includes('<a:tblPr firstRow="1" bandRow="1">')));
+  for (const [label, head, defs] of [["front matter", "---\ntable_theme_fill: off\n---\n", undefined],
+    ["defaults", "", { table_theme_fill: "off" }]]) {
+    r8 = await buildWith(head + grid8, tplBuf, defs);
+    ts = await tableSlides(r8.z);
+    check("table theme fill off (" + label + "): grid and plain styles are kept",
+      ts[0].includes(GRID_ID) && ts[1].includes(PLAIN_ID) && r8.built.themedTables === 0);
+  }
+  r8 = await buildWith("---\ntable_theme_fill: off\n---\n" + grid8, tplEnBuf);
+  ts = await tableSlides(r8.z);
+  check("table theme fill off: a fill-less style carries the body text colour",
+    cnt(ts[0].split("<a:tbl>")[1], /<a:solidFill><a:srgbClr val="FFFFFF"\/><\/a:solidFill>/g) >= 2);
+
+  const tsx = '<a:tblStyleLst def="{AAAA}"><a:tblStyle styleId="{AAAA}" styleName="x"><a:wholeTbl>' +
+    '<a:tcStyle><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill>' +
+    '</a:tcStyle></a:wholeTbl></a:tblStyle><a:tblStyle styleId="{BBBB}" styleName="y">' +
+    '<a:wholeTbl><a:tcStyle><a:tcBdr/></a:tcStyle></a:wholeTbl></a:tblStyle></a:tblStyleLst>';
+  check("styleHasFills: the two No Style GUIDs paint nothing",
+    !api.styleHasFills(GRID_ID, "") && !api.styleHasFills(PLAIN_ID, ""));
+  check("styleHasFills: a built-in GUID the template does not define counts as coloured",
+    api.styleHasFills("{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}", ""));
+  check("styleHasFills: a template-defined style is judged by its XML",
+    api.styleHasFills("{AAAA}", tsx) && !api.styleHasFills("{BBBB}", tsx));
+
+  // template keywords
+  const kwd = api.resolveKeywords({});
+  check("default keywords: RU anchor kept as prefix, EN anchor replaces the line",
+    j(kwd.topicAnchors) === j([["На тему", true], ["Topic", false]]) &&
+    kwd.titleMarker === '<p:ph type="title"/>' && kwd.bodyMarker === '<p:ph idx="1"/>');
+  check("topic_anchors parsing: order, (keep), trimming and empty entries",
+    j(api.parseAnchors(" Тема доклада (keep) , Subject,, ")) === j([["Тема доклада", true], ["Subject", false]]));
+  threw8 = "";
+  try { api.resolveKeywords({ body_marker: "idx=1" }); } catch (e) { threw8 = String(e.message); }
+  check("a marker that is not a <p:ph> tag raises", threw8.includes("body_marker"), threw8);
+
+  // a template copy with a custom anchor and body placeholders carrying type="body"
+  const cz = await JSZip.loadAsync(tplBuf);
+  const edit = async (name, a, b) => {
+    const t = await cz.file(name).async("string");
+    if (!t.includes(a)) throw new Error("edit target missing in " + name);
+    cz.file(name, t.replace(a, b));
+  };
+  await edit("ppt/slides/slide1.xml", "На тему", "Тема доклада");
+  await edit("ppt/slides/slide2.xml", '<p:ph idx="1"/>', '<p:ph type="body" idx="1"/>');
+  await edit("ppt/slides/slide3.xml", '<p:ph idx="1"/>', '<p:ph type="body" idx="1"/>');
+  const customTpl = await cz.generateAsync({ type: "nodebuffer" });
+  const simple8 = "# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n";
+  threw8 = "";
+  try { await buildWith(simple8, customTpl); } catch (e) { threw8 = String(e.message); }
+  check("an unknown topic anchor raises, naming the anchors tried",
+    threw8.includes("topic anchor") && threw8.includes("На тему"), threw8);
+  threw8 = "";
+  try { await buildWith("---\ntopic_anchors: Тема доклада (keep)\n---\n" + simple8, customTpl); } catch (e) { threw8 = String(e.message); }
+  check("a body placeholder the marker does not match names body_marker and the slide",
+    threw8.includes("body_marker") && threw8.includes("slide"), threw8);
+  const headKw = '---\ntopic_anchors: Тема доклада (keep)\nbody_marker: <p:ph type="body" idx="1"/>\n---\n';
+  r8 = await buildWith(headKw + simple8, customTpl);
+  check("a custom anchor marked (keep) stays as the prefix of the topic line",
+    (await r8.z.file("ppt/slides/slide1.xml").async("string")).includes("Тема доклада: Тема"));
+  check("a custom body marker fills the plan and content slides",
+    (await r8.z.file("ppt/slides/slide2.xml").async("string")).includes("Один") &&
+    (await r8.z.file("ppt/slides/slide3.xml").async("string")).includes("пункт"));
+  r8 = await buildWith('---\ntopic_anchors: Тема доклада\nbody_marker: <p:ph type="body" idx="1"/>\n---\n' + simple8, customTpl);
+  const k1 = await r8.z.file("ppt/slides/slide1.xml").async("string");
+  check("a custom anchor without (keep) replaces the whole line by the topic",
+    !k1.includes("Тема доклада: Тема") && texts(k1).includes("Тема"));
+  r8 = await buildWith(simple8, customTpl, { topic_anchors: "Тема доклада (keep)", body_marker: '<p:ph type="body" idx="1"/>' });
+  check("keywords also arrive as defaults (command line / web app)",
+    (await r8.z.file("ppt/slides/slide1.xml").async("string")).includes("Тема доклада: Тема"));
 
   if (failures.length) {
     console.log("FAILED: " + failures.length + " check(s)");

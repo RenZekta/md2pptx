@@ -354,9 +354,10 @@ check("table options: widths 3,2,2,2 of the full body width",
       re.findall(r'<a:gridCol w="(\d+)"/>', s7) == ["2743200", "1828800", "1828800", "1828800"])
 check("table options: size 15 stamped on every cell run",
       set(re.findall(r'<a:rPr[^>]* sz="(\d+)"', s7)) == {"1500"})
-check("table options: firstRow + firstCol + bandRow, grid style",
+check("table options: firstRow + firstCol + bandRow; a grid table with no coloured cell gets the theme default style",
       '<a:tblPr firstRow="1" firstCol="1" bandRow="1">' in s7
-      and "{5940675A-B579-460E-94D1-54222C63F5DA}" in s7)
+      and "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" in s7
+      and "{5940675A-B579-460E-94D1-54222C63F5DA}" not in s7)
 check("merged cells: one colspan, three rowspans, covered cells flagged",
       s7.count('gridSpan="2"') == 1 and s7.count('rowSpan="2"') == 3
       and s7.count('hMerge="1"') == 1 and s7.count('vMerge="1"') == 3,
@@ -566,8 +567,8 @@ ce = ze.read("ppt/charts/chart1.xml").decode("utf-8")
 check("chart text takes the master's body colour and typeface",
       '<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="Poppins"/>' in ce)
 s6e = xe(7)
-check("cells of a fill-less table style carry the body text colour",
-      s6e.count('<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>') >= 6)
+check("a fill-less style given the theme default leaves the cell text colour to the style",
+      '<a:solidFill>' not in s6e.split("<a:tbl>")[1])
 check("the default table style keeps its own cell colours",
       '<a:solidFill>' not in xe(9).split("<a:tbl>")[1])
 
@@ -583,6 +584,186 @@ check("validation reports a duplicate relationship id",
       any("duplicate relationship id" in p_ for p_ in engine.validate(dup_path)))
 check("fit check passes for the English deck", engine.fit_check(en_doc) == [],
       repr(engine.fit_check(en_doc)))
+
+print("[8] settings: tolerant front matter, table theme fill, template keywords, CLI")
+
+
+def quiet_build(text, template, name, settings=None):
+    out_path = os.path.join(OUT, name)
+    with contextlib.redirect_stdout(io.StringIO()):
+        doc_, _n, _b = engine.build(text, template, out_path, settings)
+    return doc_, zipfile.ZipFile(out_path)
+
+
+def edited_template(src, dst, edits):
+    """Copy of the template `src` with (old, new) text edits applied per part."""
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            for old, new in edits.get(item.filename, []):
+                txt = data.decode("utf-8")
+                assert old in txt, (item.filename, old)
+                data = txt.replace(old, new, 1).encode("utf-8")
+            zout.writestr(item, data)
+
+
+def table_slides(zf):
+    """XML of the slides that carry a table, in file order."""
+    names = sorted((n for n in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                   key=lambda n: int(re.findall(r"\d+", n)[0]))
+    return [x for x in (zf.read(n).decode("utf-8") for n in names) if "<a:tbl>" in x]
+
+
+def unstamped_runs(zf):
+    """Number of generated content-slide runs without a lang attribute."""
+    names = [n for n in zf.namelist() if re.match(r"ppt/slides/slide[3-9]\.xml$", n)]
+    return sum(len(re.findall(r"<a:r><a:rPr(?![^>]*lang=)", zf.read(n).decode("utf-8")))
+               for n in names)
+
+
+body = "# title\nT\n\n# slide\n\n## H\n\nПривет, мир\n"
+for label, head in (
+        ("no fence", "body_size: 18  \nlang: ru-RU\n\n"),
+        ("fence", "---\nbody_size: 18\nlang: ru-RU\n---\n\n"),
+        ("byte-order mark", "\ufeff---\nlang: ru-RU\n---\n"),
+        ("blank lines first", "\n\n---\nlang: ru-RU\n---\n")):
+    d, zf = quiet_build(head + body, TEMPLATE, "fm.pptx")
+    check("front matter (%s): lang declared" % label, d["lang"] == "ru-RU", repr(d["lang"]))
+    check("front matter (%s): every content-slide run stamped" % label,
+          unstamped_runs(zf) == 0, str(unstamped_runs(zf)))
+d, zf = quiet_build(body, TEMPLATE, "fm.pptx")
+check("without a lang the content slide runs are left unstamped",
+      d["lang"] is None and unstamped_runs(zf) > 0)
+d, _z = quiet_build("---\nlang: de-DE\n---\n" + body, TEMPLATE, "fm.pptx",
+                    {"lang": "ru-RU", "body_size": "20"})
+check("a front matter setting wins over the defaults passed in",
+      d["lang"] == "de-DE" and d["body_size"] == 20, repr((d["lang"], d["body_size"])))
+d, _z = quiet_build(body, TEMPLATE, "fm.pptx", {"lang": "ru-RU"})
+check("defaults apply when the file declares nothing", d["lang"] == "ru-RU")
+d = engine.parse_md("---\nlnag: ru-RU\nlang: ru-RU\n---\n" + body)
+check("an unknown front matter key is reported, the valid one kept",
+      d["lang"] == "ru-RU" and any("lnag" in w for w in d["warnings"]), repr(d["warnings"]))
+d = engine.parse_md("Some intro line\nlang: ru-RU\n\n" + body)
+check("stray text before the first section is reported",
+      d["lang"] == "ru-RU" and any("Some intro" in w for w in d["warnings"]), repr(d["warnings"]))
+try:
+    engine.parse_md("---\ntable_theme_fill: maybe\n---\n" + body)
+    check("an invalid table_theme_fill raises", False, "no exception raised")
+except SystemExit as e:
+    check("an invalid table_theme_fill raises", "table_theme_fill" in str(e), str(e))
+
+grid = ("# title\nT\n\n# slide\n\n## H\n\n{style: grid}\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"
+        "\n# slide\n\n## H2\n\n{style: plain}\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"
+        "\n# slide\n\n## H3\n\n| A | B |\n| - | - |\n| 1 | 2 |\n")
+GRID_ID, PLAIN_ID = "{5940675A-B579-460E-94D1-54222C63F5DA}", "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
+d, zf = quiet_build(grid, TEMPLATE, "tf.pptx")
+slides = table_slides(zf)
+check("table theme fill is on by default",
+      d["table_theme_fill"] is True and d["themed_tables"] == 2, repr(d["themed_tables"]))
+check("grid and plain tables with no coloured cell take the theme default style",
+      all("<a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId>" in x
+          for x in slides))
+check("the themed tables keep the header and banding flags",
+      len(slides) == 3 and all('<a:tblPr firstRow="1" bandRow="1">' in x for x in slides))
+check("a table already on the default style is not counted", d["themed_tables"] == 2)
+for label, kwargs in (("front matter", {"head": "---\ntable_theme_fill: off\n---\n"}),
+                      ("defaults", {"settings": {"table_theme_fill": "off"}})):
+    d, zf = quiet_build(kwargs.get("head", "") + grid, TEMPLATE, "tf_off.pptx",
+                        kwargs.get("settings"))
+    slides = table_slides(zf)
+    check("table theme fill off (%s): grid and plain styles are kept" % label,
+          GRID_ID in slides[0] and PLAIN_ID in slides[1] and d["themed_tables"] == 0)
+d, zf = quiet_build("---\ntable_theme_fill: off\n---\n" + grid, TEMPLATE_EN, "tf_en_off.pptx")
+check("table theme fill off: a fill-less style carries the body text colour",
+      table_slides(zf)[0].split("<a:tbl>")[1].count(
+          '<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>') >= 2)
+
+tsx = ('<a:tblStyleLst def="{AAAA}"><a:tblStyle styleId="{AAAA}" styleName="x"><a:wholeTbl>'
+       '<a:tcStyle><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill>'
+       '</a:tcStyle></a:wholeTbl></a:tblStyle><a:tblStyle styleId="{BBBB}" styleName="y">'
+       '<a:wholeTbl><a:tcStyle><a:tcBdr/></a:tcStyle></a:wholeTbl></a:tblStyle></a:tblStyleLst>')
+check("style_has_fills: the two No Style GUIDs paint nothing",
+      not engine.style_has_fills(GRID_ID, "") and not engine.style_has_fills(PLAIN_ID, ""))
+check("style_has_fills: a built-in GUID the template does not define counts as coloured",
+      engine.style_has_fills("{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}", ""))
+check("style_has_fills: a template-defined style is judged by its XML",
+      engine.style_has_fills("{AAAA}", tsx) and not engine.style_has_fills("{BBBB}", tsx))
+
+# template keywords
+kw_ru = engine.resolve_keywords({})
+check("default keywords: RU anchor kept as prefix, EN anchor replaces the line",
+      kw_ru["topic_anchors"] == [("На тему", True), ("Topic", False)]
+      and kw_ru["title_marker"] == '<p:ph type="title"/>' and kw_ru["body_marker"] == '<p:ph idx="1"/>')
+check("topic_anchors parsing: order, (keep), trimming and empty entries",
+      engine.parse_anchors(" Тема доклада (keep) , Subject,, ") == [("Тема доклада", True), ("Subject", False)])
+try:
+    engine.resolve_keywords({"body_marker": "idx=1"})
+    check("a marker that is not a <p:ph> tag raises", False, "no exception raised")
+except SystemExit as e:
+    check("a marker that is not a <p:ph> tag raises", "body_marker" in str(e), str(e))
+
+custom_tpl = os.path.join(OUT, "custom_keywords.pptx")
+edited_template(TEMPLATE, custom_tpl, {
+    "ppt/slides/slide1.xml": [("На тему", "Тема доклада")],
+    "ppt/slides/slide2.xml": [('<p:ph idx="1"/>', '<p:ph type="body" idx="1"/>')],
+    "ppt/slides/slide3.xml": [('<p:ph idx="1"/>', '<p:ph type="body" idx="1"/>')]})
+simple = "# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n"
+try:
+    quiet_build(simple, custom_tpl, "kw.pptx")
+    check("an unknown topic anchor raises", False, "no exception raised")
+except SystemExit as e:
+    check("an unknown topic anchor raises, naming the anchors tried",
+          "topic anchor" in str(e) and "На тему" in str(e), str(e))
+try:
+    quiet_build("---\ntopic_anchors: Тема доклада (keep)\n---\n" + simple, custom_tpl, "kw.pptx")
+    check("a body placeholder the marker does not match raises", False, "no exception raised")
+except SystemExit as e:
+    check("a body placeholder the marker does not match names body_marker and the slide",
+          "body_marker" in str(e) and "slide" in str(e), str(e))
+head_kw = ("---\ntopic_anchors: Тема доклада (keep)\n"
+           "body_marker: <p:ph type=\"body\" idx=\"1\"/>\n---\n")
+d, zf = quiet_build(head_kw + simple, custom_tpl, "kw.pptx")
+s1 = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+check("a custom anchor marked (keep) stays as the prefix of the topic line",
+      "Тема доклада: Тема" in s1, repr(texts(s1)))
+check("a custom body marker fills the plan and content slides",
+      "Один" in zf.read("ppt/slides/slide2.xml").decode("utf-8")
+      and "пункт" in zf.read("ppt/slides/slide3.xml").decode("utf-8")
+      and engine.validate(os.path.join(OUT, "kw.pptx")) == [])
+d, zf = quiet_build("---\ntopic_anchors: Тема доклада\nbody_marker: <p:ph type=\"body\" idx=\"1\"/>\n---\n"
+                    + simple, custom_tpl, "kw2.pptx")
+check("a custom anchor without (keep) replaces the whole line by the topic",
+      texts(zf.read("ppt/slides/slide1.xml").decode("utf-8")).count("Тема") == 1
+      and "Тема доклада: Тема" not in zf.read("ppt/slides/slide1.xml").decode("utf-8"))
+d, zf = quiet_build(simple, custom_tpl, "kw3.pptx",
+                    {"topic_anchors": "Тема доклада (keep)",
+                     "body_marker": '<p:ph type="body" idx="1"/>'})
+check("keywords also arrive as defaults (command line / web app)",
+      "Тема доклада: Тема" in zf.read("ppt/slides/slide1.xml").decode("utf-8"))
+
+# command line
+cli = engine.parse_cli(["s.md", "t.pptx", "o.pptx", "--lang", "ru-RU",
+                        "--table-theme-fill", "off", "--topic-anchors", "A (keep)"])
+check("parse_cli maps the options onto the settings",
+      cli == ("s.md", "t.pptx", "o.pptx",
+              {"lang": "ru-RU", "table_theme_fill": "off", "topic_anchors": "A (keep)"}), repr(cli))
+check("parse_cli rejects a missing output path", engine.parse_cli(["s.md", "t.pptx"]) is None)
+import subprocess
+bom_md = os.path.join(OUT, "bom.md")
+with open(bom_md, "w", encoding="utf-8-sig") as f:
+    f.write("---\nlang: ru-RU\n---\n" + body)
+run = subprocess.run([sys.executable, os.path.join(REPO, "md2pptx", "engine.py"), bom_md,
+                      TEMPLATE, os.path.join(OUT, "cli.pptx"), "--table-theme-fill", "off"],
+                     capture_output=True, text=True)
+check("the command line builds a file saved with a byte-order mark and reports its lang",
+      run.returncode == 0 and "lang: ru-RU (stamped" in run.stdout, run.stdout + run.stderr)
+bom_raw = os.path.join(OUT, "bom_raw.md")
+with open(bom_raw, "wb") as f:
+    f.write(b"\xef\xbb\xbf---\nlang: ru-RU\n---\n" + body.encode("utf-8"))
+run = subprocess.run([sys.executable, os.path.join(REPO, "md2pptx", "engine.py"), bom_raw,
+                      TEMPLATE, os.path.join(OUT, "cli2.pptx")], capture_output=True, text=True)
+check("a raw UTF-8 BOM in the file does not hide the front matter",
+      "lang: ru-RU (stamped" in run.stdout, run.stdout + run.stderr)
 
 if fails:
     print("FAILED: %d check(s)" % len(fails))

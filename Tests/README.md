@@ -52,10 +52,23 @@ and the JS engine core in `webapp/index.html`. Run from the repo root:
   paragraph spacing in the estimate, sentinel-index layouts (unique idx,
   explicit box and list style), body text colour on charts and fill-less
   tables, and the duplicate-id validation.
+  Settings section: the front matter is read with fences, without fences, after
+  a byte-order mark and after blank lines (each stamps `lang` on every content
+  run), a front matter value wins over the defaults passed in, unknown keys and
+  stray text become warnings, an invalid `table_theme_fill` is rejected;
+  `style: grid` / `plain` tables take the default style when `table_theme_fill`
+  is on (and keep the header and banding flags) and keep their own style when it
+  is off, `style_has_fills` on built-in and template-defined styles; the
+  template keywords (default anchors, `(keep)` parsing, invalid marker, an
+  unknown anchor, a body marker the slide does not match, a custom anchor with
+  and without `(keep)`, custom markers on a template copy, keywords given as
+  defaults); the command-line options and a structure file saved with a
+  byte-order mark.
   Writes `out/ru_deck_py.pptx`, `out/lang_deck_py.pptx`,
   `out/numbering_deck_py.pptx` and `out/en_deck_py.pptx` (the parity inputs).
 - `run_tests_js.js` — the same checks on the JS core extracted from
-  `webapp/index.html` (including the preview's `numberLabels` and slide-size handling), plus byte-identical part-by-part parity against
+  `webapp/index.html` (including the preview's `numberLabels` and slide-size handling, and
+  the same settings section as `run_tests.py`), plus byte-identical part-by-part parity against
   `out/ru_deck_py.pptx`, `out/lang_deck_py.pptx`,
   `out/numbering_deck_py.pptx` and `out/en_deck_py.pptx` (all produced by
   `run_tests.py` — run that first). An embedded chart workbook is a zip whose

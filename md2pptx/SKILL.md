@@ -30,6 +30,10 @@ Exact invocation, arguments in this order:
     python <skill-dir>/engine.py <structure.md> <template.pptx> <output>.pptx
 
 - `<skill-dir>` — this skill's folder (where `SKILL.md` and `engine.py` live).
+- Optional settings follow the three paths: `--lang`, `--body-size`,
+  `--table-theme-fill on|off`, `--topic-anchors`, `--title-marker`,
+  `--body-marker`. They are defaults for the front-matter keys of the same name,
+  which win when both are given.
 - Name the output file after the deck topic — `<topic>.pptx` (the `# title`
   topic text, sanitized), not a generic `output.pptx`.
 - Exit code `0` = success, `1` = validation failure.
@@ -43,7 +47,9 @@ Exact invocation, arguments in this order:
         fit: all content slides within the box (estimate)
 
   (the lang line reads `lang: not set (template default)` when the key is
-  absent)
+  absent; a `tables:` line notes how many tables were given the theme-coloured
+  default style, and each `warning:` line names a front-matter problem such as
+  an unknown key)
 
   `validation: FAILED` lists one line per problem. If any slide overflows the
   body box, the last block becomes `fit warnings (...)` with one line per
@@ -57,13 +63,16 @@ Exact invocation, arguments in this order:
 The engine assumes the template's first four slides are exactly:
 
 - **slide1 — title**: a shape (a text box or a placeholder) with a line
-  containing the anchor string `На тему` (Russian standard — the engine keeps
+  containing a topic anchor: `На тему` (Russian standard — the engine keeps
   the `На тему: <тема>` format by prepending `На тему: ` to the `# title`
   topic) or `Topic` (English — the whole line is replaced by the `# title`
-  topic). Either way the new paragraph is bold and keeps the original run's
-  font/lang.
+  topic). The anchors, and whether each one is kept as a prefix, are the
+  `topic_anchors` setting. Either way the new paragraph is bold and keeps the
+  original run's font/lang.
 - **slide2 — plan**: title placeholder `<p:ph type="title"/>` and body
-  placeholder `<p:ph idx="1"/>`. The title's text is the default plan title
+  placeholder `<p:ph idx="1"/>` (these tags are the defaults of the
+  `title_marker` and `body_marker` settings; the content slide and the
+  closing slide use them too). The title's text is the default plan title
   (a trailing `(...)` hint is dropped); a `## <title>` line in `# plan`
   overrides it.
 - **slide3 — content**: the content-slide prototype, same two placeholders.
@@ -95,7 +104,12 @@ do not work around it; fix/replace the template or report the mismatch.
 ## The `structure.md` format
 A single source of truth. The engine reads it and produces the deck.
 
-**Front matter** (optional keys in a leading block):
+**Front matter** (optional keys in a leading block, written between two `---`
+lines). The engine also reads the keys when the fences are missing (`key: value`
+lines before the first `# ` heading), and tolerates a byte-order mark or blank
+lines at the top of the file; an unknown key or stray text there is reported as
+a warning rather than ignored silently. Every key can also be given as a default
+(command-line option, web-app Settings panel); a value in the front matter wins.
 - `body_size: <pt>` — baseline font size for the plan-slide items and the
   table cells (both at `body_size - 1` pt). Without it the template's own body
   size is used (read from the content slide's body placeholder), so leave it out
@@ -106,6 +120,22 @@ A single source of truth. The engine reads it and produces the deck.
   default language (English), flagging non-English text as "misspelled"; with
   it, every generated run and paragraph end mark gets `lang="<tag>"`
   `dirty="0"` (the same stamp PowerPoint puts on pasted runs).
+- `table_theme_fill: on|off` (default `on`) — a table whose style paints no
+  cell (`style: plain` or `grid`, or a template whose default table style has no
+  fills) is given the template's default table style instead, so its colours come
+  from the theme: an accent-coloured header row and filled body rows. `off` keeps
+  such tables as written. Command line: `--table-theme-fill on|off`.
+- `topic_anchors: <text>[ (keep)], ...` (default `На тему (keep), Topic`) — the
+  text on the title slide that marks the topic line, tried in order. `(keep)`
+  keeps the anchor in front of the topic (`На тему: <тема>`); any other anchor's
+  whole line is replaced by the topic. Command line: `--topic-anchors`.
+- `title_marker: <tag>` (default `<p:ph type="title"/>`) and `body_marker: <tag>`
+  (default `<p:ph idx="1"/>`) — the placeholder tags, as written in the
+  template's slide XML, that identify the title and the body on the plan,
+  content and closing slides. Set them when a custom template's placeholders
+  carry other attributes (for example `<p:ph type="body" idx="1"/>`). The
+  engine stops with a message naming the setting when a slide has no match.
+  Command line: `--title-marker`, `--body-marker`.
 
 **Slide sections**, in presentation order:
 - `# title` — the title slide (freeform topic line; the topic text only —
@@ -153,7 +183,9 @@ A single source of truth. The engine reads it and produces the deck.
   - `first-col: on` — the table style's first-column formatting.
   - `banded: off` — no alternating row shading.
   - `style: default|plain|grid` — the template's default table style, no style
-    (no fills, no rules), or no fills with a table grid.
+    (no fills, no rules), or no fills with a table grid. With `table_theme_fill`
+    on (the default) `plain` and `grid` give way to the theme-coloured default
+    style; set `table_theme_fill: off` to keep them.
 - Merged cells: a cell that is exactly `<<` joins the cell to its left, `^^`
   the cell above; a `<<` under a `^^` joins the same block. The range shows the
   content of its top-left cell. A marker with nothing to join (first column or

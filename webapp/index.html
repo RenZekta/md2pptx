@@ -212,6 +212,26 @@ Thank you"></textarea>
                 <input type="text" class="mono" id="setBodyMarker" placeholder="&lt;p:ph idx=&quot;1&quot;/&gt;" autocomplete="off" spellcheck="false">
                 <div class="hint">The body placeholder tag on the plan and content slides.</div>
               </div>
+              <div class="setting">
+                <label for="setTitleSlide">Title slide</label>
+                <input type="text" class="mono" id="setTitleSlide" placeholder="detect" autocomplete="off" spellcheck="false">
+                <div class="hint">Which slide of the template plays each part: a 1-based position in the deck ("3" counts the slides in the order they play, not their file names), or a part name such as <code>slide7.xml</code>. Leave empty to detect it: the title slide is the one carrying the topic anchor, the plan and content slides are the first two after it that have a title and a body placeholder, the closing slide is the last one left that has a title and no body.</div>
+              </div>
+              <div class="setting">
+                <label for="setPlanSlide">Plan slide</label>
+                <input type="text" class="mono" id="setPlanSlide" placeholder="detect" autocomplete="off" spellcheck="false">
+                <div class="hint">Also accepts <code>none</code> for a template with no table-of-contents slide — the deck then has no plan section.</div>
+              </div>
+              <div class="setting">
+                <label for="setContentSlide">Content slide</label>
+                <input type="text" class="mono" id="setContentSlide" placeholder="detect" autocomplete="off" spellcheck="false">
+                <div class="hint">This is the slide every content slide is cloned from.</div>
+              </div>
+              <div class="setting">
+                <label for="setClosingSlide">Closing slide</label>
+                <input type="text" class="mono" id="setClosingSlide" placeholder="detect" autocomplete="off" spellcheck="false">
+                <div class="hint">Also accepts <code>none</code>. Slides the deck does not use — the template's own extra slides included — are dropped from the output.</div>
+              </div>
             </div>
           </details>
           <div class="actions">
@@ -227,6 +247,10 @@ Thank you"></textarea>
           <label class="check"><input type="checkbox" id="pdfCb"> PDF preview</label>
         </div>
         <div class="hint" style="margin-top:8px">Copies the format + deck-quality rules — paste them into a chat model together with your topic to have it write the outline (no example structure in the prompt, so the model isn't pinned to a fixed slide/point count).</div>
+      </div>
+      <div class="card">
+        <h2>Template</h2>
+        <div class="hint" id="tmplInfo" style="white-space:pre-line;max-height:190px;overflow:auto">Load a .pptx to see which of its slides the engine will use as the title, plan, content and closing slide, and which layout names a <code>layout:</code> line can take. Nothing here is assumed: the roles are read from the slides themselves and can be overruled under Settings → Template keywords.</div>
       </div>
       <div class="card">
         <h2>Output</h2>
@@ -721,6 +745,14 @@ function resolveKeywords(settings) {
   return kw;
 }
 
+// The index the body keyword names, or null when it names none: with none,
+// every geometry lookup takes the template's first body placeholder instead of
+// assuming index 1.
+function bodyIdx(kw) {
+  const m = /\bidx="([0-9]+)"/.exec((kw || DEFAULT_KEYWORDS).bodyMarker);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 // [anchor, keep] of the first topic anchor present in the title slide;
 // throws when none is found.
 function topicAnchor(titleXml, kw) {
@@ -729,27 +761,332 @@ function topicAnchor(titleXml, kw) {
     if (titleXml.indexOf(a[0]) >= 0) return a;
   }
   throw new Error("no title-slide topic anchor found (expected " +
-    anchors.map(function (a) { return "'" + a[0] + "'"; }).join(" or ") + ")");
+    anchors.map(function (a) { return pyRepr(a[0]); }).join(" or ") + ")");
 }
 
-// Fail early, naming the setting to change, when a template slide lacks the
-// keyword the engine needs from it.
-function checkTemplateKeywords(slideXml, kw, needPlan, needClosing) {
-  const need = [[TITLE_SLIDE, "title slide", null],
-    [CONTENT_SLIDE, "content slide (slide3)", [kw.titleMarker, kw.bodyMarker]]];
-  if (needPlan) need.push([PLAN_SLIDE, "plan slide (slide2)", [kw.titleMarker, kw.bodyMarker]]);
-  if (needClosing) need.push([CLOSE_SLIDE, "closing slide (slide4)", [kw.titleMarker]]);
+// [anchor, keep] of the first topic anchor present in `xml`, or null.
+function findTopicAnchor(xml, kw) {
+  for (const a of (kw || DEFAULT_KEYWORDS).topicAnchors) {
+    if (xml.indexOf(a[0]) >= 0) return a;
+  }
+  return null;
+}
+
+// How the topic line gets onto the title slide: the topic anchor the template
+// carries, or - when it has no anchor text but does have a title placeholder -
+// that placeholder, into which the topic is written as a plain title. null
+// means the template offers neither.
+function titleSlot(xml, kw) {
+  const found = findTopicAnchor(xml, kw);
+  if (found) return [found[0], found[1], false];
+  if (xml.indexOf(kw.titleMarker) >= 0) return [kw.titleMarker, false, true];
+  return null;
+}
+
+// Python's repr() of a string, so an error message quotes a keyword the same
+// way in both engines.
+function pyRepr(s) {
+  s = String(s);
+  const q = (s.indexOf("'") >= 0 && s.indexOf('"') < 0) ? '"' : "'";
+  let out = "";
+  for (const ch of s) {
+    if (ch === "\\") out += "\\\\";
+    else if (ch === q) out += "\\" + q;
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\t") out += "\\t";
+    else out += ch;
+  }
+  return q + out + q;
+}
+
+// Every <p:ph> tag of a slide as [tag, isTitle, isBody]: the structural view of
+// a slide, which is what role detection reads. It does not depend on the
+// markers the user set, so detection stays meaningful when they are wrong for
+// this template.
+function slidePhs(xml) {
+  const out = [];
+  const re = /<p:ph\b[^>]*\/?>/g;
+  let m;
+  while ((m = re.exec(xml))) {
+    const tag = m[0];
+    const t = /\btype="([^"]+)"/.exec(tag);
+    const typ = t ? t[1] : null;
+    const isTitle = typ === "title";
+    const isBody = (!isTitle && (typ === null || typ === "body" || typ === "obj") &&
+      tag.indexOf('orient="vert"') < 0);
+    out.push([tag, isTitle, isBody]);
+  }
+  return out;
+}
+
+// What one template slide offers the engine, as role detection sees it: its
+// topic anchor (or null), whether it has a title and a body placeholder at all,
+// and whether the exact title/body markers the engine writes into are present.
+// `texts` maps a slide part name to its XML text.
+function slideFeatures(texts, name, kw) {
+  const xml = texts[name];
+  const phs = slidePhs(xml);
+  let hasTitle = false, hasBody = false;
+  for (const p of phs) {
+    if (p[1]) hasTitle = true;
+    if (p[2]) hasBody = true;
+  }
+  return { file: name, pos: slideNo(name), anchor: findTopicAnchor(xml, kw),
+    title: hasTitlePh(xml, kw) || hasTitle,
+    body: xml.indexOf(kw.bodyMarker) >= 0 || hasBody,
+    titleMarker: xml.indexOf(kw.titleMarker) >= 0,
+    bodyMarker: xml.indexOf(kw.bodyMarker) >= 0 };
+}
+
+// The number N of `ppt/slides/slideN.xml`.
+function slideNo(name) {
+  return parseInt(/([0-9]+)\.xml$/.exec(name)[1], 10);
+}
+
+// The template's slides as part names, in the order presentation.xml lists them
+// (the order PowerPoint shows them). Parts the presentation does not list are
+// not slides of the deck and are ignored. The engine's own contract numbering
+// (title/plan/content/closing) is the slide's FILE number, so detection sorts
+// this list by file number; the presentation position is only used to talk to
+// the user.
+function slideOrder(texts, pres, presRels) {
+  const byRid = {};
+  for (const tag of (presRels.match(/<Relationship\b[^>]*>/g) || [])) {
+    if (!/Type="[^"]*\/relationships\/slide"/.test(tag)) continue;
+    const rid = /\bId="([^"]+)"/.exec(tag);
+    const tgt = /\bTarget="([^"]*slide[0-9]+\.xml)"/.exec(tag);
+    if (rid && tgt) {
+      const name = "ppt/slides/" + tgt[1].split("/").pop();
+      if (Object.prototype.hasOwnProperty.call(texts, name)) byRid[rid[1]] = name;
+    }
+  }
+  const order = [], seen = {};
+  for (const tag of (pres.match(/<p:sldId\b[^>]*>/g) || [])) {
+    const rid = /\br:id="([^"]+)"/.exec(tag);
+    const name = rid ? byRid[rid[1]] : null;
+    if (name && !seen[name]) { seen[name] = true; order.push(name); }
+  }
+  return order;
+}
+
+const ROLE_SETTINGS = { title: "title_slide", plan: "plan_slide",
+  content: "content_slide", closing: "closing_slide" };
+const NO_SLIDE = "none";     // a *_slide setting that says "this template has none"
+
+// A `*_slide` setting resolved to a slide part name: null when the setting is
+// empty (auto-detect), NO_SLIDE when it says `none`, a part name when it is
+// `slide7.xml`, or the slide at that 1-based PowerPoint position when it is a
+// number. Throws naming the setting when it points nowhere.
+function roleTarget(raw, key, order) {
+  const v = String(raw === null || raw === undefined ? "" : raw).trim().toLowerCase();
+  if (!v) return null;
+  if (v === "none" || v === "no" || v === "off" || v === "-") {
+    if (key === "title_slide" || key === "content_slide") {
+      throw new Error(key + " cannot be " + pyRepr(String(raw)) +
+        ": a deck always needs a title slide and a content slide to clone");
+    }
+    return NO_SLIDE;
+  }
+  if (/^[0-9]+$/.test(v)) {
+    const n = parseInt(v, 10);
+    if (n < 1 || n > order.length) {
+      throw new Error(key + " " + pyRepr(String(raw)) + " is out of range: this " +
+        "template has " + order.length + " slide(s) (positions: " +
+        order.map(function (p, i) { return (i + 1) + "=" + p.split("/").pop(); }).join(", ") + ")");
+    }
+    return order[n - 1];
+  }
+  const name = v.indexOf("/") >= 0 ? v : "ppt/slides/" + v;
+  if (order.indexOf(name) < 0) {
+    throw new Error(key + " " + pyRepr(String(raw)) + " is not a slide of this " +
+      "template (give a 1-based position, or a part name such as slide" +
+      (order.length ? slideNo(order[0]) : 1) + ".xml)");
+  }
+  return name;
+}
+
+// The four template roles, chosen from what each slide offers — a reading of
+// the template alone, independent of which sections a given deck has:
+//   title   the first slide carrying a topic anchor, else the first slide with
+//           a title and no body, else the first slide;
+//   plan    the first slide after it that has both placeholders;
+//   content the next one that has both, which is the slide every other content
+//           slide is cloned from (with only one such slide, it is the plan
+//           slide's turn to serve);
+//   closing the last remaining slide with a title and no body, else the first
+//           remaining slide with a title.
+// This is what the engine's contract has always meant by 'the first four
+// slides', only read from the slides instead of from their file names, so a
+// template that follows the contract is detected as it always behaved. Every
+// guess can be overruled with title_slide, plan_slide, content_slide and
+// closing_slide.
+function detectRoles(order, feats) {
+  order = order.slice().sort(function (a, b) { return slideNo(a) - slideNo(b); });
+  let title = null;
+  for (const n of order) { if (feats[n].anchor) { title = n; break; } }
+  // A title-only slide counts as the cover only while no slide before it has
+  // already claimed the title-plus-body role: the cover is what comes first.
+  const both = order.findIndex(function (n) { return feats[n].title && feats[n].body; });
+  if (!title) {
+    for (let i = 0; i < order.length; i++) {
+      const n = order[i];
+      if (feats[n].title && !feats[n].body && (both < 0 || i < both)) { title = n; break; }
+    }
+  }
+  if (!title) title = order.length ? order[0] : null;
+  if (!title) throw new Error("this template has no slides to take roles from");
+  const after = order.slice(order.indexOf(title) + 1);
+  const cands = after.filter(function (n) { return feats[n].title && feats[n].body; });
+  let plan = null, content = null;
+  if (cands.length >= 2) { plan = cands[0]; content = cands[1]; }
+  else if (cands.length) content = cands[0];
+  const used = {}; used[title] = true;
+  if (plan) used[plan] = true;
+  if (content) used[content] = true;
+  const left = after.filter(function (n) { return !used[n]; });
+  let closing = null;
+  for (let i = left.length - 1; i >= 0; i--) {
+    if (feats[left[i]].title && !feats[left[i]].body) { closing = left[i]; break; }
+  }
+  if (!closing) {
+    for (const n of left) { if (feats[n].title) { closing = n; break; } }
+  }
+  return { title: title, plan: plan, content: content, closing: closing };
+}
+
+// The title_slide / plan_slide / content_slide / closing_slide overrides applied
+// to a role dict, then checked: no slide may serve two roles. An empty setting
+// leaves the detected role alone; `none` switches it off.
+function applyRoleSettings(roles, settings, order) {
+  for (const role of ["title", "plan", "content", "closing"]) {
+    const key = ROLE_SETTINGS[role];
+    const t = roleTarget((settings || {})[key], key, order);
+    if (t === null) continue;
+    roles[role] = (t === NO_SLIDE) ? null : t;
+  }
+  const seen = {};
+  for (const role of ["title", "plan", "content", "closing"]) {
+    const n = roles[role];
+    if (!n) continue;
+    if (seen[n]) {
+      throw new Error(ROLE_SETTINGS[seen[n]] + " and " + ROLE_SETTINGS[role] +
+        " name the same slide (" + n.split("/").pop() + "); a slide can serve " +
+        "only one role");
+    }
+    seen[n] = role;
+  }
+  return roles;
+}
+
+// The template roles for this deck: detectRoles()'s reading of the template,
+// with each `*_slide` setting applied on top, the roles the deck has no section
+// for dropped, and the resulting conflicts reported (one slide serving two
+// roles, a role the deck needs that is missing or was switched off). An
+// explicit setting always wins; detection only fills what is left to it.
+function resolveRoles(order, feats, settings, needPlan, needClosing) {
+  const roles = applyRoleSettings(detectRoles(order, feats), settings, order);
+  const pairs = [["plan", needPlan], ["closing", needClosing]];
+  for (const p of pairs) {
+    const role = p[0];
+    if (!p[1]) { roles[role] = null; continue; }
+    if (roles[role]) continue;
+    const key = ROLE_SETTINGS[role];
+    const raw = String((settings || {})[key] === null || (settings || {})[key] === undefined ?
+      "" : (settings || {})[key]).trim().toLowerCase();
+    if (raw === "none" || raw === "no" || raw === "off" || raw === "-") {
+      throw new Error(key + " is set to none but this deck has a '# " + role +
+        "' section; delete the setting (or the section) to let the engine pick " +
+        "the slide");
+    }
+    throw new Error("this template has no " + role + " slide to write the deck's '# " +
+      role + "' section on (" + (role === "closing"
+        ? "a closing slide needs at least a title placeholder"
+        : "a " + role + " slide needs a title and a body placeholder") +
+      "); set " + key + " to the slide to use");
+  }
+  return roles;
+}
+
+// One line per role and per unused slide, as the engine reports what it found:
+// part name, PowerPoint position, file number, and why.
+function roleReport(roles, order, feats, master) {
+  const pos = {};
+  order.forEach(function (n, i) { pos[n] = i + 1; });
+  const why = function (n) {
+    const f = feats[n];
+    const bits = [];
+    if (f.anchor) bits.push("anchor " + pyRepr(f.anchor[0]));
+    if (f.title) bits.push("title" + (f.titleMarker ? "" : "*"));
+    if (f.body) bits.push("body" + (f.bodyMarker ? "" : "*"));
+    return bits.join(", ");
+  };
+  const pad = function (s) { while (s.length < 8) s += " "; return s; };
+  const lines = [];
+  for (const role of ["title", "plan", "content", "closing"]) {
+    const n = roles[role];
+    lines.push(n ? "  " + pad(role + ":") + " " + n.split("/").pop() + " (position " +
+      pos[n] + ", " + n + ": " + why(n) + ")" : "  " + pad(role + ":") + " not used");
+  }
+  const used = {};
+  for (const r of ["title", "plan", "content", "closing"]) {
+    if (roles[r]) used[roles[r]] = true;
+  }
+  const left = order.filter(function (n) { return !used[n]; });
+  if (left.length) {
+    lines.push("  unused   " + left.map(function (n) { return n.split("/").pop(); })
+      .join(", ") + " (dropped from the deck)");
+  }
+  lines.push("  master   " + master.split("/").pop());
+  return lines;
+}
+
+// Fail early, naming the setting to change, when a slide role detection picked
+// cannot serve it.
+function checkTemplateKeywords(texts, kw, roles, needPlan, needClosing) {
+  const tm = kw.titleMarker, bm = kw.bodyMarker;
+  const need = [["title", "title slide", null],
+    ["content", "content slide", [tm, bm]]];
+  if (needPlan) need.push(["plan", "plan slide", [tm, bm]]);
+  if (needClosing) need.push(["closing", "closing slide", [tm]]);
   for (const n of need) {
-    const xml = slideXml[n[0]];
-    if (n[2] === null) { topicAnchor(xml, kw); continue; }
-    for (const m of n[2]) {
+    const role = n[0], label = n[1], markers = n[2];
+    const name = roles[role];
+    if (!name) {
+      throw new Error("the template has no " + label + " for this deck (no slide " +
+        "matches its role); set " + ROLE_SETTINGS[role] + " to a slide that has " +
+        "the placeholders, or to none to leave this slide out");
+    }
+    const xml = texts[name];
+    const short = name.split("/").pop();
+    if (markers === null) {
+      if (titleSlot(xml, kw) === null) {
+        throw new Error("no title-slide topic anchor found in " + short + " (expected " +
+          kw.topicAnchors.map(function (a) { return pyRepr(a[0]); }).join(" or ") +
+          ", or a title placeholder matching title_marker " + pyRepr(tm) + " to " +
+          "write the topic into); set topic_anchors to the text that marks the " +
+          "topic line, or title_slide to the slide to use");
+      }
+      continue;
+    }
+    for (const m of markers) {
       if (xml.indexOf(m) < 0) {
-        const key = m === kw.titleMarker ? "title_marker" : "body_marker";
-        throw new Error("the template's " + n[1] + " has no placeholder matching " +
-          key + " '" + m + "'; set " + key + " to the placeholder tag it uses");
+        const key = m === tm ? "title_marker" : "body_marker";
+        throw new Error("the template's " + label + " (" + short + ") has no " +
+          "placeholder matching " + key + " " + pyRepr(m) + "; set " + key +
+          " to the placeholder tag it uses, or " + ROLE_SETTINGS[role] +
+          " to the slide to use");
       }
     }
   }
+}
+
+// What a template can do as `layout:` lines: [{name, title, bodies}] per slide
+// layout, in numeric order. A two-column slide needs one with a title and two
+// side-by-side body placeholders.
+function layoutSummary(texts, kw) {
+  return layoutCatalog(texts, kw).map(function (c) {
+    return { name: c[1], title: c[2], bodies: c[3].length };
+  });
 }
 const CONTENT_SLIDE = "ppt/slides/slide3.xml";
 const CONTENT_RELS = "ppt/slides/_rels/slide3.xml.rels";
@@ -792,6 +1129,11 @@ const MAX_SERIES = 25;                   // workbook columns B..Z
 
 function esc(t) {
   return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Quote a string for use inside a RegExp built from a part name or an id.
+function escRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // Split text into [text, bold, italic, underline] runs on the inline marks
@@ -1496,7 +1838,8 @@ const SENTINEL_IDX = 4294967000;
 // block], ordered by idx and then left to right, top to bottom (placeholders
 // that share the sentinel idx are told apart by position). Footer, date,
 // slide number, picture and vertical-text placeholders are not body
-// placeholders.
+// placeholders. A body placeholder that declares no idx carries PowerPoint's
+// default body index (1).
 function bodyPhs(layoutXml) {
   const out = [];
   for (const sp of (layoutXml.match(/<p:sp>[\s\S]*?<\/p:sp>/g) || [])) {
@@ -1505,9 +1848,9 @@ function bodyPhs(layoutXml) {
     const tag = m[0];
     const idx = /\bidx="([0-9]+)"/.exec(tag);
     const typ = /\btype="([^"]+)"/.exec(tag);
-    if (!idx || (typ && typ[1] !== "body" && typ[1] !== "obj")) continue;
+    if (typ && typ[1] !== "body" && typ[1] !== "obj") continue;
     if (tag.indexOf('orient="vert"') >= 0) continue;
-    out.push([parseInt(idx[1], 10), tag, spBox(sp), sp]);
+    out.push([idx ? parseInt(idx[1], 10) : 1, tag, spBox(sp), sp]);
   }
   out.sort(function (a, b) {
     return (a[0] - b[0]) || ((a[2] ? a[2][0] : 0) - (b[2] ? b[2][0] : 0)) ||
@@ -1516,11 +1859,20 @@ function bodyPhs(layoutXml) {
   return out;
 }
 
-// The slide master's body placeholder box, the end of the geometry chain.
-function masterBodyBox(geo) {
-  const xml = geo[MASTER];
+// The body placeholder box at the end of the geometry chain: the master the
+// content slides inherit from (see masterOf), the placeholder the body keyword
+// names, else the master's first body placeholder, else DEFAULT_BOX.
+function masterBodyBox(geo, kw, master) {
+  const xml = geo[master === undefined || master === null ? MASTER : master];
   if (xml === undefined) return DEFAULT_BOX;
-  return spBox(spBlock(xml, '<p:ph type="body" idx="1"/>')) || DEFAULT_BOX;
+  const phs = bodyPhs(xml);
+  const want = bodyIdx(kw);
+  let block = null;
+  for (const ph of phs) {
+    if (want === null || ph[0] === want) { block = ph[3]; break; }
+  }
+  if (block === null && want !== null && phs.length) block = phs[0][3];
+  return spBox(block) || DEFAULT_BOX;
 }
 
 // The slide layout part a slide's rels point at, or null.
@@ -1529,12 +1881,37 @@ function layoutFile(relsXml) {
   return m ? "ppt/slideLayouts/" + m[1] : null;
 }
 
-// The <p:sp> of the layout (named by a slide's rels) body placeholder with
-// this idx, or null.
+// The rels part of any package part.
+function partRels(name) {
+  const i = name.lastIndexOf("/");
+  return name.slice(0, i) + "/_rels/" + name.slice(i + 1) + ".rels";
+}
+
+// The slide master a slide inherits through its layout. A package may carry
+// several masters; the body geometry, theme colours and fonts must come from
+// the one the content slides actually use, not from slideMaster1.xml. Falls
+// back to MASTER when the chain is not there.
+function masterOf(geo, slideRels) {
+  const lay = layoutFile(slideRels);
+  if (lay) {
+    const rels = geo[partRels(lay)];
+    if (rels !== undefined) {
+      const m = /Target="[^"]*(slideMaster[0-9]+\.xml)"/.exec(rels);
+      if (m) {
+        const name = "ppt/slideMasters/" + m[1];
+        if (geo[name] !== undefined) return name;
+      }
+    }
+  }
+  return MASTER;
+}
+
+// The <p:sp> of the layout (named by a slide's rels) body placeholder `idx`,
+// or its first body placeholder when idx is null, or null.
 function layoutBodyBlock(geo, relsXml, idx) {
   const lay = geo[layoutFile(relsXml) || ""];
   if (lay !== undefined) {
-    for (const ph of bodyPhs(lay)) if (ph[0] === idx) return ph[3];
+    for (const ph of bodyPhs(lay)) if (idx === null || idx === undefined || ph[0] === idx) return ph[3];
   }
   return null;
 }
@@ -1542,14 +1919,25 @@ function layoutBodyBlock(geo, relsXml, idx) {
 // [box, layout block] of the clone prototype's body placeholder. The box is
 // the slide's own geometry, else its layout's, else the master's; the block is
 // the layout's placeholder (null without one).
-function defaultBody(geo, contentXml, contentRels, kw) {
-  const block = layoutBodyBlock(geo, contentRels, 1);
+function defaultBody(geo, contentXml, contentRels, kw, master) {
+  const block = layoutBodyBlock(geo, contentRels, bodyIdx(kw));
   const box = spBox(spBlock(contentXml, (kw || DEFAULT_KEYWORDS).bodyMarker)) || spBox(block);
-  return [box || masterBodyBox(geo), block];
+  return [box || masterBodyBox(geo, kw, master), block];
 }
 
-// [file, name, hasTitle, bodyPhs] of every layout, in numeric order.
-function layoutCatalog(geo) {
+// Any title placeholder tag, the loose form of the title keyword.
+const TITLE_PH_RE = /<p:ph\b[^>]*\btype="title"/;
+
+// True when the XML declares a title placeholder: the title keyword itself, or
+// any <p:ph type="title" ...> tag.
+function hasTitlePh(xml, kw) {
+  return (xml.indexOf((kw || DEFAULT_KEYWORDS).titleMarker) >= 0) || TITLE_PH_RE.test(xml);
+}
+
+// [file, name, hasTitle, bodyPhs] of every layout, in numeric order. hasTitle
+// accepts the title keyword or any title placeholder tag, so a template whose
+// title carries an idx is still a titled layout.
+function layoutCatalog(geo, kw) {
   const files = Object.keys(geo).filter(function (n) {
     return /^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/.test(n);
   }).sort(function (a, b) {
@@ -1558,7 +1946,7 @@ function layoutCatalog(geo) {
   return files.map(function (f) {
     const x = geo[f];
     const nm = /<p:cSld name="([^"]*)"/.exec(x);
-    return [f, nm ? nm[1] : "", x.indexOf('<p:ph type="title"/>') >= 0, bodyPhs(x)];
+    return [f, nm ? nm[1] : "", hasTitlePh(x, kw), bodyPhs(x)];
   });
 }
 
@@ -1588,15 +1976,18 @@ function blockSz(block) {
 //           explicit xfrm and a copy of the list style, because nothing can
 //           link it to the layout placeholder
 //   spacing effectiveSpacing() at the column's size
-// `dflt` is defaultBody()'s [box, block] (engine.py:plan_slide).
-function planSlide(geo, dflt, bodyPt, layoutKey, ncols, kw) {
-  const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
+// `dflt` is defaultBody()'s [box, block] (engine.py:plan_slide). `master` is
+// the master the content slides inherit from (masterOf); it defaults to the
+// classic first master.
+function planSlide(geo, dflt, bodyPt, layoutKey, ncols, kw, master) {
+  const masterFile = (master === null || master === undefined) ? MASTER : master;
+  const masterXml = geo[masterFile] === undefined ? "" : geo[masterFile];
   if (layoutKey === null && ncols === 1) {
     return { file: null, phs: [{ tag: (kw || DEFAULT_KEYWORDS).bodyMarker, box: dflt[0], pt: bodyPt, block: dflt[1],
       orphan: false, spacing: effectiveSpacing(dflt[1], masterXml, bodyPt) }] };
   }
-  const catalog = layoutCatalog(geo);
-  const masterBox = masterBodyBox(geo);
+  const catalog = layoutCatalog(geo, kw);
+  const masterBox = masterBodyBox(geo, kw, masterFile);
   let found;
   if (layoutKey === null || layoutKey.toLowerCase() === "two-content") {
     found = catalog.filter(function (c) { return isTwoContent(c, masterBox); });
@@ -2016,9 +2407,10 @@ async function workbookBytes(ch) {
 }
 
 // Colour of the master's level-1 body text as an <a:solidFill> element, or ""
-// when the master declares none (engine.py:body_color).
-function bodyColor(geo) {
-  const x = geo[MASTER];
+// when the master declares none (engine.py:body_color). `master` is the master
+// the content slides inherit from (masterOf).
+function bodyColor(geo, master) {
+  const x = geo[(master === null || master === undefined) ? MASTER : master];
   if (x === undefined) return "";
   const i = x.indexOf("<p:bodyStyle>");
   const j = i !== -1 ? x.indexOf("<a:lvl1pPr", i) : -1;
@@ -2029,8 +2421,8 @@ function bodyColor(geo) {
 }
 
 // Typeface of the master's level-1 body text, or null.
-function bodyFont(geo) {
-  const x = geo[MASTER];
+function bodyFont(geo, master) {
+  const x = geo[(master === null || master === undefined) ? MASTER : master];
   if (x === undefined) return null;
   const i = x.indexOf("<p:bodyStyle>");
   const j = i !== -1 ? x.indexOf("<a:lvl1pPr", i) : -1;
@@ -2082,26 +2474,35 @@ function unesc(text) {
     .replace(/&apos;/g, "'").replace(/&amp;/g, "&");
 }
 
-// Where the template's four slides sit in presentation.xml and where the
-// clones may go: { slots: {slide file: [sldId id, rId]} for slide1..slide4,
-// nextSid, nextRid (numbers), nextFile }. Everything is read from the
-// template, so a template with its own ids and relationships (or more parts)
-// is cloned without collisions.
-function packageSlots(names, pres, presRels) {
+// Where the template's role slides sit in presentation.xml and where the clones
+// may go: { slots: {slide file: [sldId id, rId]} for each used role slide,
+// nextSid, nextRid (numbers), nextFile }. Everything is read from the template,
+// so a template with its own ids and relationships (or more parts) is cloned
+// without collisions.
+function packageSlots(names, pres, presRels, roles) {
   const slots = {};
-  for (let n = 1; n <= 4; n++) {
-    const fn = "ppt/slides/slide" + n + ".xml";
-    const rel = new RegExp('<Relationship\\b[^>]*Target="slides/slide' + n + '\\.xml"[^>]*>').exec(presRels);
+  for (const role of ["title", "plan", "content", "closing"]) {
+    const fn = roles[role];
+    if (!fn) continue;
+    const short = fn.split("/").pop();
+    const rel = new RegExp('<Relationship\\b[^>]*Target="[^"]*' + escRe(short) +
+      '"[^>]*>').exec(presRels);
     const rid = rel ? /\bId="([^"]+)"/.exec(rel[0]) : null;
-    const sld = rid ? new RegExp('<p:sldId\\b[^>]*\\br:id="' + rid[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+    const sld = rid ? new RegExp('<p:sldId\\b[^>]*\\br:id="' + escRe(rid[1]) +
       '"[^>]*>').exec(pres) : null;
     const sid = sld ? /\bid="([0-9]+)"/.exec(sld[0]) : null;
     if (!sid) {
-      throw new Error("template slide" + n + ".xml is not listed in presentation.xml (the first " +
-        "four slides must be title, plan, content, closing)");
+      throw new Error("template " + short + " is not listed in presentation.xml " +
+        "(a role slide must be a real slide of the deck)");
     }
     slots[fn] = [parseInt(sid[1], 10), rid[1]];
   }
+  return packageCounters(names, pres, presRels, slots);
+}
+
+// {nextSid, nextRid, nextFile}: the first free numbers, clearing every id and
+// slide part the template already has, however many of them it has.
+function packageCounters(names, pres, presRels, slots) {
   const sids = (pres.match(/<p:sldId\b[^>]*\bid="[0-9]+"/g) || []).map(function (m) {
     return parseInt(/\bid="([0-9]+)"/.exec(m)[1], 10);
   });
@@ -2116,6 +2517,68 @@ function packageSlots(names, pres, presRels) {
   return { slots: slots, nextSid: Math.max.apply(null, sids.concat([255])) + 1,
     nextRid: Math.max.apply(null, rids.concat([0])) + 1,
     nextFile: Math.max.apply(null, files.concat([4])) + 1 };
+}
+
+// A slide part name, as pruneSlides recognises them.
+const SLIDE_PART = /^ppt\/slides\/slide[0-9]+\.xml$/;
+
+// Drop the template slides this deck does not use: the extra slides a custom
+// template carries, and the role slides the deck has no section for. A dropped
+// slide takes its rels part, its [Content_Types].xml override and its
+// presentation.xml.rels entry with it, plus the notes parts only it referenced,
+// so nothing points into the package from outside. Mutates `zip`; returns the
+// rewritten presentation.xml.rels and [Content_Types].xml.
+async function pruneSlides(zip, presRels, ct, used) {
+  const drop = Object.keys(zip.files).filter(function (n) {
+    return SLIDE_PART.test(n) && !used[n];
+  });
+  if (!drop.length) return [presRels, ct];
+  const keepNotes = {};
+  for (const n of Object.keys(used)) {
+    const f = zip.file(relsName(n));
+    if (!f) continue;
+    for (const t of ((await f.async("string")).match(/Target="[^"]*notesSlide[0-9]+\.xml"/g) || [])) {
+      keepNotes[/"([^"]*)"/.exec(t)[1].split("/").pop()] = true;
+    }
+  }
+  const gone = drop.slice();
+  for (const n of drop) {
+    const f = zip.file(relsName(n));
+    if (!f) continue;
+    for (const t of ((await f.async("string")).match(/Target="[^"]*notesSlide[0-9]+\.xml"/g) || [])) {
+      const name = "ppt/notesSlides/" + /"([^"]*)"/.exec(t)[1].split("/").pop();
+      if (!keepNotes[name.split("/").pop()] && zip.file(name)) gone.push(name);
+    }
+  }
+  for (const n of gone) {
+    zip.remove(n);
+    if (zip.file(relsName(n))) zip.remove(relsName(n));
+    const short = n.split("/").pop();
+    ct = ct.replace(new RegExp('<Override PartName="/[^"]*' + escRe(short) + '"[^>]*/>'), "");
+    if (SLIDE_PART.test(n)) {
+      presRels = presRels.replace(new RegExp('<Relationship\\b[^>]*Target="[^"]*' +
+        escRe(short) + '"[^>]*/>'), "");
+    }
+  }
+  return [presRels, ct];
+}
+
+const SLIDE_CT = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+
+// Declare the content type of every slide part the deck keeps. A template
+// whose [Content_Types].xml omits a slide (sloppy exports, or a tool that
+// stripped the override of a slide it hid) would otherwise produce a package
+// PowerPoint refuses to open. A well-formed template is left untouched, so the
+// bytes of a normal build do not change.
+function ensureSlideContentTypes(ct, used) {
+  const missing = Object.keys(used).filter(function (n) {
+    return SLIDE_PART.test(n) &&
+      !(new RegExp('<Override\\b[^>]*PartName="/' + escRe(n) + '"')).test(ct);
+  }).sort();
+  if (!missing.length) return ct;
+  return ct.replace("</Types>", missing.map(function (n) {
+    return '<Override PartName="/' + n + '" ContentType="' + SLIDE_CT + '"/>';
+  }).join("") + "</Types>");
 }
 
 // The plan slide's title as the template has it, minus a trailing
@@ -2245,32 +2708,61 @@ function styleHasFills(styleId, tableStylesXml) {
   return m ? m[0].indexOf("<a:fill>") >= 0 : true;
 }
 
-// Effective body font size (pt) of the template's content slide:
-// slide3 body placeholder -> its slide layout -> OOXML default 18 pt.
-async function resolveBodySize(zip, contentXml, kw) {
-  const sz = placeholderSz(contentXml, (kw || DEFAULT_KEYWORDS).bodyMarker);
+// Effective body font size (pt) of the template's content slide: its body
+// placeholder -> the body placeholder of its slide layout (the one the body
+// keyword names, else the layout's first) -> OOXML default 18 pt. `content` /
+// `contentRels` default to the classic slide3 pair.
+async function resolveBodySize(zip, contentXml, kw, content, contentRels) {
+  kw = kw || DEFAULT_KEYWORDS;
+  content = content || CONTENT_SLIDE;
+  const sz = placeholderSz(contentXml, kw.bodyMarker);
   if (sz) return sz;
-  const rels = await (await zip.file(CONTENT_RELS).async("string"));
-  const m = rels.match(/Target="([^"]*slideLayout\d+\.xml)"/);
+  if (contentRels === null || contentRels === undefined) {
+    const f = zip.file(relsName(content));
+    contentRels = f ? await f.async("string") : "";
+  }
+  const m = /Target="([^"]*slideLayout\d+\.xml)"/.exec(contentRels);
   if (m) {
-    const layoutName = "ppt/slideLayouts/" + m[1].split("/").pop();
-    const f = zip.file(layoutName);
+    const f = zip.file("ppt/slideLayouts/" + m[1].split("/").pop());
     if (f) {
-      const lx = await f.async("string");
-      const pm = lx.match(/<p:ph[^>]*idx="1"[^>]*\/>/);
-      if (pm) {
-        const start = lx.lastIndexOf("<p:sp>", pm.index);
-        const end = lx.indexOf("</p:sp>", pm.index);
-        const sm = lx.slice(start, end).match(/sz="(\d+)"/);
-        if (sm) return Math.floor(parseInt(sm[1], 10) / 100);
+      const want = bodyIdx(kw);
+      for (const ph of bodyPhs(await f.async("string"))) {
+        if (want === null || ph[0] === want) return blockSz(ph[3]) || 18;
       }
     }
   }
   return 18;
 }
 
+// What a template offers, without building a deck: the roles the engine would
+// pick for a deck with these sections, the slides it would leave out, the
+// master it reads styles and geometry from, and its layouts. `zip` is a loaded
+// JSZip of the template. Used by the web app's template card.
+async function detectTemplate(zip, settings, needPlan, needClosing) {
+  const texts = {};
+  for (const name of Object.keys(zip.files)) {
+    if (/\.(xml|rels)$/.test(name)) texts[name] = await zip.file(name).async("string");
+  }
+  const kw = resolveKeywords(settings);
+  const order = slideOrder(texts, texts["ppt/presentation.xml"],
+    texts["ppt/_rels/presentation.xml.rels"]);
+  const feats = {};
+  for (const name of order) feats[name] = slideFeatures(texts, name, kw);
+  const roles = resolveRoles(order, feats, settings, needPlan !== false,
+    needClosing !== false);
+  const content = roles.content;
+  let master = MASTER;
+  if (content && texts[relsName(content)] !== undefined) {
+    master = masterOf(texts, texts[relsName(content)]);
+  }
+  return { order: order.slice(), roles: roles, auto: detectRoles(order, feats),
+    features: feats, master: master, layouts: layoutSummary(texts, kw),
+    report: roleReport(roles, order, feats, master) };
+}
+
 const FRONT_KEYS = ["body_size", "lang", "table_theme_fill", "topic_anchors",
-  "title_marker", "body_marker"];
+  "title_marker", "body_marker", "title_slide", "plan_slide", "content_slide",
+  "closing_slide"];
 
 // true / false from an on-off setting (on, off, true, false, yes, no, 1, 0);
 // anything else throws.
@@ -2369,6 +2861,7 @@ function parseMd(text, defaults) {
 
   const doc = { bodySize: bodySize, TOC: TOC, tablePt: TOC, lang: lang,
     tableThemeFill: tableThemeFill, keywords: keywords, warnings: warnings,
+    settings: settings,
     title: null, plan: null, planTitle: null, slides: [], closing: null };
   for (const sec of sections) {
     const header = sec[0], body = sec[1];
@@ -2405,29 +2898,48 @@ async function buildZip(templateBuffer, doc) {
   let pres = await getXml("ppt/presentation.xml");
   let presRels = await getXml("ppt/_rels/presentation.xml.rels");
   let ct = await getXml("[Content_Types].xml");
-  const contentXml = await getXml(CONTENT_SLIDE);
-  const contentRels = await getXml(CONTENT_RELS);
   const kw = doc.keywords || DEFAULT_KEYWORDS;
   const titleMarker = kw.titleMarker, bodyMarker = kw.bodyMarker;
-  const slideXml = {};
-  for (const name of [TITLE_SLIDE, PLAN_SLIDE, CONTENT_SLIDE, CLOSE_SLIDE]) {
-    slideXml[name] = await getXml(name);
+
+  // Which template slide serves which role: detectRoles() reads the slides,
+  // and the title_slide / plan_slide / content_slide / closing_slide settings
+  // may overrule it. Nothing is assumed about the slide file names.
+  const needPlan = doc.plan !== null, needClosing = doc.closing !== null;
+  const geo = await loadGeometryParts(zip);           // layouts, masters, rels
+  for (const name of Object.keys(zip.files)) {        // the slides themselves
+    if (/^ppt\/slides\/(slide[0-9]+\.xml|_rels\/slide[0-9]+\.xml\.rels)$/.test(name)) {
+      geo[name] = await zip.file(name).async("string");
+    }
   }
-  checkTemplateKeywords(slideXml, kw, doc.plan !== null, doc.closing !== null);
-  const bodyPt = await resolveBodySize(zip, contentXml, kw);
+  const order = slideOrder(geo, pres, presRels);
+  const feats = {};
+  for (const name of order) feats[name] = slideFeatures(geo, name, kw);
+  const roles = resolveRoles(order, feats, doc.settings, needPlan, needClosing);
+  checkTemplateKeywords(geo, kw, roles, needPlan, needClosing);
+  const titleSlide = roles.title, planSlidePart = roles.plan;
+  const contentSlide = roles.content, closingSlide = roles.closing;
+  const contentXml = await getXml(contentSlide);
+  const contentRels = await getXml(relsName(contentSlide));
+  const master = masterOf(geo, contentRels);
+  doc.template = { order: order.slice(), roles: roles,
+    auto: detectRoles(order, feats), features: feats, master: master,
+    layouts: layoutSummary(geo, kw),
+    report: roleReport(roles, order, feats, master) };
+  const bodyPt = await resolveBodySize(zip, contentXml, kw, contentSlide, contentRels);
   if (doc.bodySize === null) {
     doc.bodySize = bodyPt;
     doc.TOC = doc.tablePt = bodyPt - 1;
   }
-  const pk = packageSlots(Object.keys(zip.files), pres, presRels);
+  // Counters taken from the template before any clone is added, so a template
+  // with its own extra slides never collides with the clones.
+  const pk = packageSlots(Object.keys(zip.files), pres, presRels, roles);
 
   // Where each slide's columns go (layout file, placeholder tags, boxes).
   // Resolved before anything is written so a bad layout fails early.
-  const geo = await loadGeometryParts(zip);
-  const masterXml = geo[MASTER] === undefined ? "" : geo[MASTER];
-  const dflt = defaultBody(geo, contentXml, contentRels, kw);
+  const masterXml = geo[master] === undefined ? "" : geo[master];
+  const dflt = defaultBody(geo, contentXml, contentRels, kw, master);
   const plans = doc.slides.map(function (sl) {
-    return planSlide(geo, dflt, bodyPt, sl[2], sl[1].length, kw);
+    return planSlide(geo, dflt, bodyPt, sl[2], sl[1].length, kw, master);
   });
   doc.geom = plans.map(function (pl) {
     return pl.phs.map(function (ph) { return [ph.box, ph.pt, ph.spacing]; });
@@ -2460,40 +2972,45 @@ async function buildZip(templateBuffer, doc) {
   const sld = function (fn) {
     return '<p:sldId id="' + pk.slots[fn][0] + '" r:id="' + pk.slots[fn][1] + '"/>';
   };
-  const sldids = [sld(TITLE_SLIDE)];
-  if (doc.plan !== null) sldids.push(sld(PLAN_SLIDE));
-  sldids.push(sld(CONTENT_SLIDE));
+  const sldids = [sld(titleSlide)];
+  if (planSlidePart) sldids.push(sld(planSlidePart));
+  sldids.push(sld(contentSlide));
   for (const c of clones) sldids.push('<p:sldId id="' + c[1] + '" r:id="' + c[2] + '"/>');
-  if (doc.closing !== null) sldids.push(sld(CLOSE_SLIDE));
+  if (closingSlide) sldids.push(sld(closingSlide));
   pres = pres.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, "<p:sldIdLst>" + sldids.join("") + "</p:sldIdLst>");
 
   // 4) title slide (topic line; bold, size inherited from the template;
   //    the font of the original anchor run is kept). An anchor marked `keep`
   //    stays in front of the topic ("На тему: <тема>"); any other anchor's
-  //    whole line is replaced by the topic.
-  let titleXml = await getXml(TITLE_SLIDE);
+  //    whole line is replaced by the topic. A title slide with no anchor text
+  //    but with a title placeholder gets the topic written into that
+  //    placeholder instead.
+  let titleXml = await getXml(titleSlide);
   const topic = doc.title || "";
-  const anchorHit = topicAnchor(titleXml, kw);
+  const anchorHit = titleSlot(titleXml, kw);
   const anchor = anchorHit[0];
   const topicText = anchorHit[1] ? anchor + ": " + topic : topic;
   const topicBase = firstRpr(titleXml, anchor);
   const topicPara = '<a:p><a:r>' + mergeRpr(topicBase, [true, false, false], null, doc.lang) +
     '<a:t>' + esc(topicText) + "</a:t></a:r>" + endParaRpr(doc.lang) + "</a:p>";
-  titleXml = replacePara(titleXml, anchor, topicPara);
-  zip.file(TITLE_SLIDE, titleXml);
+  // the slot is either a run of text (an anchor) or a placeholder tag; a tag is
+  // written by replacing the placeholder's paragraphs, like every other fill
+  titleXml = anchorHit[2] ? setBlockParas(titleXml, anchor, topicPara)
+                          : replacePara(titleXml, anchor, topicPara);
+  zip.file(titleSlide, titleXml);
 
   // 5) plan slide (items stamped at body_size - 1; original rPr kept)
-  if (doc.plan !== null) {
-    let planXml = await getXml(PLAN_SLIDE);
+  if (planSlidePart) {
+    let planXml = await getXml(planSlidePart);
     const planTitleBase = firstRpr(planXml, titleMarker);
     doc.planTitleShown = doc.planTitle || planTitleText(planXml, kw);
     planXml = setBlockParas(planXml, titleMarker, titlePara(doc.planTitleShown, null, planTitleBase, doc.lang));
     const planBodyBase = firstRpr(planXml, bodyMarker);
-    const planFix = listFixes(layoutBodyBlock(geo, await getXml(relsName(PLAN_SLIDE)), 1), masterXml);
+    const planFix = listFixes(layoutBodyBlock(geo, await getXml(relsName(planSlidePart)), bodyIdx(kw)), masterXml);
     planXml = setBlockParas(planXml, bodyMarker, doc.plan.map(function (t) {
       return tocPara(t[0], doc.TOC, planBodyBase, doc.lang, t[1], t[1] ? planFix.num[0] : ["", ""]);
     }).join(""));
-    zip.file(PLAN_SLIDE, planXml);
+    zip.file(planSlidePart, planXml);
   }
 
   // 6) content slides (slide3 + clones, in order). Body runs inherit the
@@ -2503,15 +3020,15 @@ async function buildZip(templateBuffer, doc) {
   //    <p:graphicFrame> shapes below the text, table cells at the size
   //    columnFlow chose, charts wired to a chart part, its embedded workbook
   //    and a slide relationship.
-  const contentOrder = [CONTENT_SLIDE].concat(clones.map(function (c) { return c[0]; }));
+  const contentOrder = [contentSlide].concat(clones.map(function (c) { return c[0]; }));
   let tableStylesXml = "";
   if (zip.file("ppt/tableStyles.xml")) {
     tableStylesXml = await zip.file("ppt/tableStyles.xml").async("string");
   }
   const styleDefault = tableStyleId(tableStylesXml);
   let themedTables = 0;
-  const font = bodyFont(geo);
-  const color = bodyColor(geo);
+  const font = bodyFont(geo, master);
+  const color = bodyColor(geo, master);
   const layouts = [];
   let chartNo = 0, ctExtra = "";
   for (let k = 0; k < contentOrder.length; k++) {
@@ -2613,13 +3130,24 @@ async function buildZip(templateBuffer, doc) {
   }
 
   // 7) closing slide (title stamped at the template's declared size)
-  if (doc.closing !== null) {
-    let closeXml = await getXml(CLOSE_SLIDE);
+  if (closingSlide) {
+    let closeXml = await getXml(closingSlide);
     const closeSz = placeholderSz(closeXml, titleMarker) || TITLE_PT;
     const closeBase = firstRpr(closeXml, titleMarker);
     closeXml = setBlockParas(closeXml, titleMarker, titlePara(doc.closing, closeSz, closeBase, doc.lang));
-    zip.file(CLOSE_SLIDE, closeXml);
+    zip.file(closingSlide, closeXml);
   }
+
+  // 8) drop the template slides this deck does not use (its extra slides, and
+  //    the role slides the deck has no section for)
+  const used = {};
+  for (const fn of contentOrder) used[fn] = true;
+  used[titleSlide] = true;
+  if (planSlidePart) used[planSlidePart] = true;
+  if (closingSlide) used[closingSlide] = true;
+  const pruned = await pruneSlides(zip, presRels, ct, used);
+  presRels = pruned[0]; ct = pruned[1];
+  ct = ensureSlideContentTypes(ct, used);
 
   // top-level parts
   zip.file("ppt/presentation.xml", pres);
@@ -2633,15 +3161,19 @@ async function buildZip(templateBuffer, doc) {
   }
   setSlideSize(pres);
   return { zip: zip, bodyPt: bodyPt, layouts: layouts, slideSize: [SLIDE_W, SLIDE_H],
-    themedTables: themedTables };
+    themedTables: themedTables, template: doc.template };
 }
 
 // The slide master and every layout as name -> XML text: the parts the
 // geometry resolvers (planSlide and friends) read synchronously.
+// The parts the geometry and role detection read: every slide layout and slide
+// master with their rels. A package may carry several masters; the one the
+// content slides actually use is told apart by masterOf().
 async function loadGeometryParts(zip) {
   const geo = {};
   for (const name of Object.keys(zip.files)) {
-    if (name === MASTER || /^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/.test(name)) {
+    if (/^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(name) ||
+        /^ppt\/(slideLayouts|slideMasters)\/_rels\/[^/]+\.rels$/.test(name)) {
       geo[name] = await zip.file(name).async("string");
     }
   }
@@ -2681,6 +3213,16 @@ if (typeof module !== "undefined" && module.exports) {
     CONTENT_SLIDE: CONTENT_SLIDE, CONTENT_RELS: CONTENT_RELS,
     TITLE_SLIDE: TITLE_SLIDE, PLAN_SLIDE: PLAN_SLIDE, CLOSE_SLIDE: CLOSE_SLIDE,
     TITLE_PT: TITLE_PT,
+    // template role detection (mirrors engine.py)
+    DEFAULT_KEYWORDS: DEFAULT_KEYWORDS, parseAnchors: parseAnchors, resolveKeywords: resolveKeywords,
+    findTopicAnchor: findTopicAnchor, titleSlot: titleSlot, bodyIdx: bodyIdx,
+    slidePhs: slidePhs, slideFeatures: slideFeatures, slideNo: slideNo, slideOrder: slideOrder,
+    ROLE_SETTINGS: ROLE_SETTINGS, NO_SLIDE: NO_SLIDE, roleTarget: roleTarget,
+    detectRoles: detectRoles, applyRoleSettings: applyRoleSettings, resolveRoles: resolveRoles,
+    roleReport: roleReport, layoutSummary: layoutSummary, detectTemplate: detectTemplate,
+    checkTemplateKeywords: checkTemplateKeywords, masterOf: masterOf, hasTitlePh: hasTitlePh,
+    pruneSlides: pruneSlides, ensureSlideContentTypes: ensureSlideContentTypes,
+
     CONTENT_TITLE_OFF: CONTENT_TITLE_OFF, CONTENT_BODY_OFF: CONTENT_BODY_OFF,
     esc: esc, parseInline: parseInline, parseTable: parseTable, para: para,
     parseNumbered: parseNumbered, groupNumbering: groupNumbering,
@@ -2741,7 +3283,13 @@ if (typeof module !== "undefined" && module.exports) {
   // guarded and the panel works without it.
   const SETTINGS_KEY = "md2pptx.settings";
   const SETTING_FIELDS = { lang: "setLang", body_size: "setBody", topic_anchors: "setAnchors",
-    title_marker: "setTitleMarker", body_marker: "setBodyMarker" };
+    title_marker: "setTitleMarker", body_marker: "setBodyMarker",
+    title_slide: "setTitleSlide", plan_slide: "setPlanSlide", content_slide: "setContentSlide",
+    closing_slide: "setClosingSlide" };
+  // Settings that decide which slide of the template plays which part, so the
+  // template card below is refreshed when any of them changes.
+  const TEMPLATE_FIELDS = ["topic_anchors", "title_marker", "body_marker", "title_slide",
+    "plan_slide", "content_slide", "closing_slide"];
 
   function readSettings() {
     const out = {};
@@ -2758,7 +3306,8 @@ if (typeof module !== "undefined" && module.exports) {
       $(SETTING_FIELDS[key]).value = values[key] || "";
     });
     $("setTableFill").checked = values.table_theme_fill !== "off";
-    $("kwBox").open = !!(values.topic_anchors || values.title_marker || values.body_marker);
+    $("kwBox").open = !!(values.topic_anchors || values.title_marker || values.body_marker ||
+      values.title_slide || values.plan_slide || values.content_slide || values.closing_slide);
   }
 
   function saveSettings() {
@@ -2773,7 +3322,10 @@ if (typeof module !== "undefined" && module.exports) {
   }
 
   Object.keys(SETTING_FIELDS).forEach(function (key) {
-    $(SETTING_FIELDS[key]).addEventListener("input", saveSettings);
+    $(SETTING_FIELDS[key]).addEventListener("input", function () {
+      saveSettings();
+      if (TEMPLATE_FIELDS.indexOf(key) >= 0) refreshTemplateInfo();
+    });
   });
   $("setTableFill").addEventListener("change", saveSettings);
   $("setReset").addEventListener("click", function () {
@@ -2800,6 +3352,58 @@ if (typeof module !== "undefined" && module.exports) {
   $("mdfile").addEventListener("change", async function () {
     const f = this.files[0];
     if (f) $("mdtext").value = await f.text();
+  });
+
+  // ---------------- Template card ----------------
+  // Which slide of the loaded template plays which part, and which layout
+  // names a `layout:` line can take. Read-only: the answers come from the same
+  // detectTemplate()/detectRoles() the build itself uses, so the card cannot
+  // disagree with what a build does.
+  let templateBuf = null;
+
+  function templateInfoText(t) {
+    const label = { title: "title slide", plan: "plan slide",
+      content: "content slide (the one cloned)", closing: "closing slide" };
+    const pos = function (n) { return " (deck position " + (t.order.indexOf(n) + 1) +
+      " of " + t.order.length + ")"; };
+    const lines = ["title", "plan", "content", "closing"].map(function (role) {
+      const n = t.auto[role];
+      return label[role] + ": " + (n ? n.split("/").pop() + pos(n)
+                                     : "no slide of this template fits");
+    });
+    const used = {};
+    ["title", "plan", "content", "closing"].forEach(function (role) {
+      if (t.auto[role]) used[t.auto[role]] = true;
+    });
+    const extra = t.order.filter(function (n) { return !used[n]; });
+    lines.push(extra.length ? extra.length + " other slide(s) the deck will not use: " +
+      extra.map(function (n) { return n.split("/").pop(); }).join(", ")
+      : "no unused slides");
+    lines.push("master: " + t.master.split("/").pop());
+    lines.push("layouts (name and body placeholder count, for a `layout:` line): " +
+      t.layouts.map(function (l) {
+        return l.name + " (" + l.bodies + (l.title ? "+title" : "") + ")";
+      }).join(", "));
+    return lines.join("\n");
+  }
+
+  function refreshTemplateInfo() {
+    const box = $("tmplInfo");
+    if (!templateBuf) return Promise.resolve();
+    return JSZip.loadAsync(templateBuf).then(function (zip) {
+      return detectTemplate(zip, readSettings(), false, false);
+    }).then(function (t) {
+      box.textContent = templateInfoText(t);
+    }, function (e) {
+      box.textContent = "Cannot read this template with these settings: " +
+        (e && e.message ? e.message : String(e));
+    });
+  }
+
+  $("tmplfile").addEventListener("change", async function () {
+    const f = this.files[0];
+    templateBuf = f ? await f.arrayBuffer() : null;
+    refreshTemplateInfo();
   });
 
   // ---------------- Copy prompt for a model ----------------
@@ -2933,6 +3537,21 @@ if (typeof module !== "undefined" && module.exports) {
         (doc.lang ? doc.lang + " (stamped, dirty=0)" : "not set") +
         (built.themedTables ? "; " + built.themedTables + " table(s) given the theme-coloured default style" : "") +
         "). Downloaded.");
+      const tmpl = built.template;
+      if (tmpl) {
+        const part = function (n) { return n ? n.split("/").pop() : "none"; };
+        const used = {};
+        ["title", "plan", "content", "closing"].forEach(function (r) {
+          if (tmpl.roles[r]) used[tmpl.roles[r]] = true;
+        });
+        const extra = tmpl.order.filter(function (n) { return !used[n]; });
+        log("Slides taken from the template: title " + part(tmpl.roles.title) +
+          ", plan " + part(tmpl.roles.plan) + ", content " + part(tmpl.roles.content) +
+          " (cloned), closing " + part(tmpl.roles.closing) + "; master " +
+          tmpl.master.split("/").pop() +
+          (extra.length ? "; " + extra.length + " unused template slide(s) dropped: " +
+            extra.map(function (n) { return n.split("/").pop(); }).join(", ") : ""));
+      }
       doc.warnings.forEach(function (w) { log("warning: " + w); });
 
       if ($("pdfCb").checked) {

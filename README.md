@@ -43,10 +43,18 @@ the parser enforces the format deterministically.
 
 A **Settings** card holds the same options as the `structure.md` front matter —
 proofing language, body size, the table theme-fill switch and, under *Template
-keywords*, the topic anchors and the title and body placeholder tags — as
-defaults for every build. They are kept in the browser (`localStorage`), and a
-value written in the `structure.md` front matter wins over them; the log says
-which ones it overrode. *Reset to defaults* clears them.
+keywords*, the topic anchors, the title and body placeholder tags and which
+slide of the template plays each part — as defaults for every build. They are
+kept in the browser (`localStorage`), and a value written in the `structure.md`
+front matter wins over them; the log says which ones it overrode. *Reset to
+defaults* clears them.
+
+A **Template** card answers the other question a custom template raises: as soon
+as a `.pptx` is loaded it shows which of its slides the engine will take as the
+title, plan, content and closing slide (and at which position), which slides it
+will drop, which master the geometry comes from, and every layout name a
+`layout:` line can address. It is the same code the build runs, so the card
+cannot disagree with the deck; the command line equivalent is `--detect`.
 
 ## The `structure.md` format (the contract)
 
@@ -80,11 +88,39 @@ a warning rather than ignored silently. Every key can also be given as a default
   whole line is replaced by the topic. Command line: `--topic-anchors`.
 - `title_marker: <tag>` (default `<p:ph type="title"/>`) and `body_marker: <tag>`
   (default `<p:ph idx="1"/>`) — the placeholder tags, as written in the
-  template's slide XML, that identify the title and the body on the plan,
-  content and closing slides. Set them when a custom template's placeholders
-  carry other attributes (for example `<p:ph type="body" idx="1"/>`). The
-  engine stops with a message naming the setting when a slide has no match.
-  Command line: `--title-marker`, `--body-marker`.
+  template's slide XML, that identify the title and the body: of the title, plan,
+  content and closing slides, of the two-content layouts a `::: left` /
+  `::: right` slide can use, and of the box a table, chart or picture is laid out
+  in. Set them when a custom template's placeholders carry other attributes (for
+  example `<p:ph type="body" idx="2"/>`); the `idx` in `body_marker` is what
+  selects that box, so an old tag leaves the frames at a fallback position instead
+  of inside the placeholder. The engine stops with a message naming the setting
+  when a slide has no match. Command line: `--title-marker`, `--body-marker`.
+- `title_slide`, `plan_slide`, `content_slide`, `closing_slide`:
+  `<position>|<part-name>|none` — which slide of the template plays each part,
+  overruling the detection described below: a 1-based position in the deck (`3`
+  counts the slides in the order they play, not their file names) or a part name
+  such as `slide7.xml`. `plan_slide` and `closing_slide` also take `none` for a
+  template that has no such slide; `title_slide` and `content_slide` cannot,
+  because a deck always needs a cover and a slide type to clone. Two roles
+  naming one slide, or a position outside the deck, raises an error naming the
+  setting. Command line: `--title-slide`, `--plan-slide`, `--content-slide`,
+  `--closing-slide`.
+
+**Which slide of the template is which.** Nothing is assumed about the file names
+of the template's slides: the engine walks them in the order they play and takes
+the title slide as the first one carrying a topic anchor (with no anchor
+anywhere, the first slide that has a title placeholder and no body placeholder
+before any slide that has both), the plan and content slides as the first two
+after it that have a title and a body placeholder, and the closing slide as the
+last one left that has a title. The content slide is the prototype every
+`# slide` is cloned from. A template's own extra slides — cover pages, showcase
+pages, examples — and any role slide the deck has no section for are dropped
+from the output together with their relationships and content types, so a deck
+built from a downloaded template contains only its own slides. Run the engine
+with `--detect` (no output file) to see the whole reading before building:
+roles with positions and reasons, the unused slides, the master, and every
+layout name with its body-placeholder count.
 
 The template is **not** part of `structure.md` — it is supplied to the engine
 separately (a tool-call argument in the skill, a file input in the web app), so
@@ -225,6 +261,16 @@ example.
   `<a:xfrm>`, resolved slide → layout → master, and its text size for the fit
   estimate is the size the placeholder declares (28 pt in the reference
   template's two-content layout, 18 pt in its content layout).
+- **Slide roles are detected, not assumed** — no template slide has to be
+  `slide1.xml` or the fourth one: the engine reads the template's slides in the
+  order they play, finds the cover by its topic anchor, the plan and content
+  slides by their title plus body placeholders, the closing slide by what is
+  left, and takes the master through the content slide's own layout. Everything
+  geometry-related follows the `body_marker` you set, so a placeholder that is
+  not the layout's first still gives tables, charts and pictures their box.
+  Unused template slides are pruned; `--detect` (and the web app's **Template**
+  card) prints the whole reading, and `title_slide` / `plan_slide` /
+  `content_slide` / `closing_slide` overrule any of it.
 - **Templates are read, not assumed** — slide size, `sldId` and relationship
   ids, slide file numbers, list styles, paragraph spacing, text colour and the
   body size all come from the template, so a 16:9 template with its own ids and

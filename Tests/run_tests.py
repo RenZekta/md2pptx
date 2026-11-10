@@ -33,6 +33,7 @@ import io
 import os
 import re
 import sys
+import subprocess
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -740,6 +741,239 @@ d, zf = quiet_build(simple, custom_tpl, "kw3.pptx",
                      "body_marker": '<p:ph type="body" idx="1"/>'})
 check("keywords also arrive as defaults (command line / web app)",
       "Тема доклада: Тема" in zf.read("ppt/slides/slide1.xml").decode("utf-8"))
+
+# template roles: which slide of the template plays which part
+def edit_every_part(src, dst, old, new):
+    """Copy of `src` with `old` replaced by `new` in every text part that has it
+    — the way a real template's authoring tool renumbered a whole package."""
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            try:
+                txt = data.decode("utf-8")
+            except UnicodeDecodeError:
+                zout.writestr(item, data)
+                continue
+            if old in txt:
+                data = txt.replace(old, new).encode("utf-8")
+            zout.writestr(item, data)
+
+
+def shifted_template(src, dst, prepended=2):
+    """Copy of `src` with `prepended` extra slides pushed to the front of the
+    deck, so the title/plan/content/closing slides move to slide3..slide6: a
+    downloaded template that opens with a cover or a showcase page. Parts and
+    their rels are renamed highest-first, the presentation points at the new
+    names, and the new first slides are copies of the closing slide. The
+    [Content_Types].xml overrides are deliberately left pointing at the old
+    names, as an editor's stale copy of a template leaves them."""
+    with zipfile.ZipFile(src) as zin:
+        parts = {i.filename: zin.read(i.filename) for i in zin.infolist()}
+        infos = {i.filename: i for i in zin.infolist()}
+    numbers = sorted(int(re.findall(r"\d+", n)[0])
+                     for n in parts if re.match(r"ppt/slides/slide\d+\.xml$", n))
+    last = numbers[-1]
+    for n in reversed(numbers):                      # slide4->slide6, slide3->slide5, ...
+        moved = n + prepended
+        for suffix in ("ppt/slides/slide%d.xml", "ppt/slides/_rels/slide%d.xml.rels"):
+            name = suffix % n
+            if name in parts:
+                parts[suffix % moved] = parts.pop(name)
+        for name, body in list(parts.items()):       # anything that referenced the old name
+            # [Content_Types].xml is deliberately left alone: its overrides keep
+            # naming the OLD part names, the way a stale copy of a template does.
+            if name.endswith((".xml", ".rels")) and name != "[Content_Types].xml":
+                fixed = body.replace(("slides/slide%d.xml" % n).encode("utf-8"),
+                                     ("slides/slide%d.xml" % moved).encode("utf-8"))
+                if fixed != body:
+                    parts[name] = fixed
+    pres = parts["ppt/presentation.xml"].decode("utf-8")
+    pres_rels = parts["ppt/_rels/presentation.xml.rels"].decode("utf-8")
+    sids = [int(m) for m in re.findall(r'<p:sldId id="(\d+)"', pres)]
+    rids = [int(m) for m in re.findall(r'Id="rId(\d+)"', pres_rels)]
+    base, proto = prepended, "ppt/slides/slide%d.xml" % (last + prepended)
+    proto_txt = parts[proto].decode("utf-8")
+    assert "Конец" in proto_txt, "the fixture slide to clone has no 'Конец' text"
+    proto_rels = parts[rels_of(proto)].decode("utf-8")
+    added, extra_ids = [], []
+    for i in range(1, base + 1):
+        name = "ppt/slides/slide%d.xml" % i
+        parts[name] = proto_txt.replace("Конец", "Showcase %d" % i).encode("utf-8")
+        parts[rels_of(name)] = parts[rels_of(proto)]
+        rid, sid = "rId%d" % (max(rids) + i), max(sids) + i
+        pres_rels = pres_rels.replace("</Relationships>",
+                                      '<Relationship Id="%s" Type="%s/slide" Target="slides/%s"/>'
+                                      "</Relationships>" % (rid, REL_NS, name.split("/")[-1]))
+        added.append('<p:sldId id="%d" r:id="%s"/>' % (sid, rid))
+        extra_ids.append(sid)
+    parts["ppt/presentation.xml"] = re.sub(
+        r"<p:sldIdLst>", "<p:sldIdLst>" + "".join(added), pres, count=1).encode("utf-8")
+    parts["ppt/_rels/presentation.xml.rels"] = pres_rels.encode("utf-8")
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, body in parts.items():
+            zout.writestr(infos.get(name) or name, body)
+
+
+def rels_of(name):
+    """The rels part that belongs to `name`."""
+    d, _, base = name.rpartition("/")
+    return "%s/_rels/%s.rels" % (d, base)
+
+
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def drop_slide(src, dst, number):
+    """Copy of `src` with slide `number` taken out of the deck entirely."""
+    name, rel = "ppt/slides/slide%d.xml" % number, "ppt/slides/_rels/slide%d.xml.rels" % number
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename in (name, rel):
+                continue
+            data = zin.read(item.filename)
+            if item.filename.endswith(".rels"):
+                data = re.sub(b'<Relationship [^>]*Target="[^"]*slides/slide%d\\.xml"[^>]*/>'
+                              % number, b"", data)
+            elif item.filename == "[Content_Types].xml":
+                data = re.sub(b'<Override PartName="/ppt/slides/slide%d\\.xml"[^>]*/>' % number,
+                              b"", data)
+            elif item.filename == "ppt/presentation.xml":
+                rid = re.findall(b'<Relationship Id="(rId\\d+)"[^>]*Target="slides/slide%d\\.xml"'
+                                 % number, zin.read(item.filename))
+                if rid:
+                    data = re.sub(b'<p:sldId id="\\d+" r:id="%b"/>' % rid[0], b"", data)
+            zout.writestr(item, data)
+
+
+def slide_texts(zf, name):
+    return re.findall(r"<a:t>([^<]*)</a:t>", zf.read(name).decode("utf-8"))
+
+
+role_simple = ("# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n\n"
+               "# closing\n\nКонец работы\n")
+role_noplan = "# title\nТема\n\n# slide\n\n## H\n\n- пункт\n\n# closing\n\nКонец работы\n"
+
+shifted_tpl = os.path.join(OUT, "shifted_template.pptx")
+shifted_template(TEMPLATE, shifted_tpl)
+det = engine.detect_template(shifted_tpl)
+check("roles detected on a template that opens with two extra slides",
+      det["roles"] == {"title": "ppt/slides/slide3.xml", "plan": "ppt/slides/slide4.xml",
+                       "content": "ppt/slides/slide5.xml", "closing": "ppt/slides/slide6.xml"},
+      repr(det["roles"]))
+d, zf = quiet_build(role_simple, shifted_tpl, "shift.pptx")
+check("--detect and build agree on the roles", d["template"]["roles"] == det["roles"])
+check("the topic is written on the detected title slide",
+      "На тему: Тема" in "".join(slide_texts(zf, "ppt/slides/slide3.xml")),
+      repr(slide_texts(zf, "ppt/slides/slide3.xml")[:3]))
+check("the plan is written on the detected plan slide",
+      "Один" in "".join(slide_texts(zf, "ppt/slides/slide4.xml")))
+check("content goes on the detected content slide and its clones",
+      "пункт" in "".join(slide_texts(zf, "ppt/slides/slide5.xml"))
+      and "пункт" not in "".join(slide_texts(zf, "ppt/slides/slide4.xml")))
+kept = sorted(n for n in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n))
+check("the extra slides are dropped from the package",
+      "ppt/slides/slide1.xml" not in zf.namelist()
+      and "ppt/slides/_rels/slide2.xml.rels" not in zf.namelist()
+      and "ppt/slides/slide3.xml" in zf.namelist(), str(kept))
+ct = zf.read("[Content_Types].xml").decode("utf-8")
+check("every slide kept in the package declares a content type",
+      all(('PartName="/%s"' % n) in ct for n in kept),
+      str([n for n in kept if ('PartName="/%s"' % n) not in ct]))
+check("no relationship points at a dropped slide",
+      'Target="slides/slide1.xml"' not in zf.read("ppt/_rels/presentation.xml.rels").decode("utf-8"))
+check("the deck that needed no plan slide drops the plan slide too",
+      "ppt/slides/slide4.xml" not in quiet_build(role_noplan, shifted_tpl, "shift2.pptx")[1].namelist()
+      and quiet_build(role_noplan, shifted_tpl, "shift3.pptx")[0]["template"]["roles"]["content"]
+      == "ppt/slides/slide5.xml")
+
+swapped = quiet_build(role_simple, shifted_tpl, "swap.pptx",
+                      {"plan_slide": "5", "content_slide": "4"})[1]
+check("content_slide/plan_slide overrule the detected pair",
+      swapped.read("ppt/slides/slide5.xml").decode("utf-8").find("Один") > 0
+      and "пункт" in "".join(slide_texts(swapped, "ppt/slides/slide4.xml")),
+      repr(slide_texts(swapped, "ppt/slides/slide4.xml")[:3]))
+check("a part name works as a role setting too",
+      quiet_build(role_simple, shifted_tpl, "swap2.pptx",
+                  {"content_slide": "slide4.xml",
+                   "plan_slide": "slide5.xml"})[1].read("ppt/slides/slide4.xml")
+      .decode("utf-8").find("пункт") > 0)
+
+for label, settings, needle in (
+        ("a role switched off while the deck needs it", {"plan_slide": "none"}, "plan_slide"),
+        ("two roles naming one slide", {"closing_slide": "4"}, "same slide"),
+        ("a position outside the deck", {"content_slide": "9"}, "out of range"),
+        ("a part that is not a slide", {"content_slide": "no-such.xml"}, "content_slide"),
+        ("the title slide switched off", {"title_slide": "none"}, "title_slide")):
+    try:
+        quiet_build(role_simple, shifted_tpl, "roles_err.pptx", settings)
+        check("role settings: %s raises" % label, False, "no exception raised")
+    except SystemExit as e:
+        check("role settings: %s raises" % label, needle in str(e), str(e))
+
+role_noclosing = "# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n"
+noclose_tpl = os.path.join(OUT, "noclose_template.pptx")
+drop_slide(TEMPLATE, noclose_tpl, 4)
+d, zf = quiet_build(role_noclosing, noclose_tpl, "noclose.pptx")
+check("a template without a closing slide serves a deck that has none",
+      "ppt/slides/slide4.xml" not in zf.namelist()
+      and d["template"]["roles"]["closing"] is None and engine.validate(os.path.join(OUT, "noclose.pptx")) == [])
+try:
+    quiet_build(role_simple, noclose_tpl, "noclose2.pptx")
+    check("a closing section with no closing slide raises", False, "no exception raised")
+except SystemExit as e:
+    check("a closing section with no closing slide names closing_slide",
+          "closing_slide" in str(e) and "closing" in str(e), str(e))
+
+moved_tpl = os.path.join(OUT, "en_body_idx2_template.pptx")
+edit_every_part(TEMPLATE_EN, moved_tpl, '<p:ph idx="1"/>', '<p:ph type="body" idx="2"/>')
+tbl_md = "# title\nT\n\n# slide\n\n## H\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"
+def table_frame(zf):
+    """(x, y, cx, cy) of the first table's graphicFrame in the package."""
+    for n in sorted((n for n in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                    key=lambda n: int(re.findall(r"\d+", n)[0])):
+        x = zf.read(n).decode("utf-8")
+        if "<a:tbl>" in x:
+            return re.search(r'<a:off x="(\d+)" y="(\d+)"/><a:ext cx="(\d+)" cy="(\d+)"/>',
+                             x[x.find("<p:graphicFrame"):]).groups()
+
+
+_x, zframe = quiet_build(tbl_md, TEMPLATE_EN, "geom_base.pptx")
+frame = table_frame(zframe)
+_x, zmove = quiet_build(tbl_md, moved_tpl, "geom_moved.pptx",
+                        {"body_marker": '<p:ph type="body" idx="2"/>'})
+moved_frame = table_frame(zmove)
+check("a body placeholder that is not the layout's first still drives geometry",
+      moved_frame == frame and int(frame[2]) != engine.DEFAULT_BOX[2],
+      "moved=%s base=%s default_cx=%d" % (moved_frame, frame, engine.DEFAULT_BOX[2]))
+check("and the deck built with the custom marker validates",
+      engine.validate(os.path.join(OUT, "geom_moved.pptx")) == [])
+
+t0_tpl = os.path.join(OUT, "ru_title_idx0_template.pptx")
+edit_every_part(TEMPLATE, t0_tpl, '<p:ph type="title"/>', '<p:ph type="title" idx="0"/>')
+cols_md = "# title\nТема\n\n# slide\n\n## H\n\n::: left\n\n- слева\n\n::: right\n\n- справа\n"
+_x, zt0 = quiet_build(cols_md, t0_tpl, "t0.pptx",
+                      {"title_marker": '<p:ph type="title" idx="0"/>'})
+two = [n for n in zt0.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)
+       and 'sz="half"' in zt0.read(n).decode("utf-8")]
+check("a title placeholder carrying an idx is still a title placeholder, so a"
+      " two-content layout is found through title_marker", two != []
+      and engine.validate(os.path.join(OUT, "t0.pptx")) == [], str(two))
+
+en_simple = "# title\nDetection probe\n\n# slide\n\n## H\n\n- item\n"
+_x, zfb = quiet_build(en_simple, TEMPLATE_EN, "fallback.pptx",
+                      {"topic_anchors": "Nowhere to be found"})
+check("a title slide with no anchor text but a title placeholder takes the topic",
+      "<a:t>Detection probe</a:t>" in zfb.read("ppt/slides/slide1.xml").decode("utf-8")
+      and engine.validate(os.path.join(OUT, "fallback.pptx")) == [],
+      repr(slide_texts(zfb, "ppt/slides/slide1.xml")))
+
+run = subprocess.run([sys.executable, ENGINE, STRUCT, shifted_tpl, "--detect"],
+                     capture_output=True, text=True)
+check("--detect reports the roles and layouts without writing a file",
+      run.returncode == 0 and "title:   slide3.xml" in run.stdout
+      and "layouts:" in run.stdout and not os.path.exists(os.path.join(OUT, "--detect")),
+      (run.stdout + run.stderr)[:200])
+
 
 # command line
 cli = engine.parse_cli(["s.md", "t.pptx", "o.pptx", "--lang", "ru-RU",

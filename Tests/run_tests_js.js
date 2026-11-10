@@ -25,9 +25,8 @@
 //     lang + dirty="0", invalid lang rejected, and byte-identical parity
 //     vs Tests/out/lang_deck_py.pptx (both produced by run_tests.py)
 //
-// Requires: Node, and jszip 3.x. JSZIP_PATH points at the local Windows copy;
-// on other machines the plain `require("jszip")` fallback is used (install
-// jszip in a node_modules next to this test, e.g. at the repo root).
+// Requires: Node. jszip 3.x from a node_modules (JSZIP_PATH or an install next
+// to this test) or, failing that, the JSZip copy inlined in webapp/index.html.
 
 const fs = require("fs");
 const path = require("path");
@@ -37,10 +36,31 @@ const REPO = path.resolve(HERE, "..");
 const JSZIP_PATH =
   "C:/Users/Ren/AppData/Roaming/npm/node_modules/openclaw/node_modules/jszip";
 let JSZip;
+// The webapp inlines JSZip 3.10.1 (one <script> block). When no jszip is
+// installed on this machine, run that exact copy: the parity target is the
+// library the browser uses, so evaluating it is the faithful fallback.
+function bundledJszip(html) {
+  for (const block of html.split("<script>")) {
+    const end = block.indexOf("</script>");
+    const src = end < 0 ? block : block.slice(0, end);
+    if (src.indexOf("Corrupted zip or bug") < 0) continue;
+    const mod = { exports: {} };
+    new Function("module", "exports", "window", "self", "global", "document", src)(
+      mod, mod.exports, undefined, undefined, undefined, undefined);
+    if (typeof mod.exports === "function" && typeof mod.exports.loadAsync === "function") {
+      return mod.exports;
+    }
+  }
+  throw new Error("neither jszip installed nor an inlined JSZip in webapp/index.html");
+}
 try {
   JSZip = require(JSZIP_PATH);
 } catch (e) {
-  JSZip = require("jszip");
+  try {
+    JSZip = require("jszip");
+  } catch (e2) {
+    JSZip = bundledJszip(fs.readFileSync(path.join(REPO, "webapp", "index.html"), "utf8"));
+  }
 }
 
 const html = fs.readFileSync(path.join(REPO, "webapp", "index.html"), "utf8");
@@ -698,6 +718,144 @@ async function partsDiff(za, zb) {
   r8 = await buildWith(simple8, customTpl, { topic_anchors: "Тема доклада (keep)", body_marker: '<p:ph type="body" idx="1"/>' });
   check("keywords also arrive as defaults (command line / web app)",
     (await r8.z.file("ppt/slides/slide1.xml").async("string")).includes("Тема доклада: Тема"));
+
+  // ---------------- template roles: detection, overrides, pruning ----------------
+  // The fixtures and the Python outputs here are the ones run_tests.py writes,
+  // so run it first (same rule as the byte-parity builds above). Everything the
+  // Python suite asserts about roles is asserted here too, on the same inputs,
+  // and the resulting packages are compared part by part.
+  const needPyOut = (name) => {
+    const p = path.join(outDir, name);
+    if (!fs.existsSync(p)) throw new Error("run_tests.py has not produced " + p);
+    return p;
+  };
+  const rolesEqual = (a, b) => ["title", "plan", "content", "closing"]
+    .every((k) => a[k] === b[k]);
+  const frameOf = async (z2) => {
+    for (const n of slideNames(z2)) {
+      const x = await z2.file(n).async("string");
+      if (x.includes("<a:tbl>")) {
+        const m = x.slice(x.indexOf("<p:graphicFrame")).match(
+          /<a:off x="(\d+)" y="(\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"\/>/);
+        return m && m.slice(1, 5);
+      }
+    }
+    return null;
+  };
+  const roleErr = async (text, tpl, defaults) => {
+    try { await buildWith(text, tpl, defaults); return ""; } catch (e) { return String(e.message); }
+  };
+
+  const rlSimple = "# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n\n" +
+    "# closing\n\nКонец работы\n";
+  const rlNoClosing = "# title\nТема\n\n# plan\n\n1. Один\n\n# slide\n\n## H\n\n- пункт\n";
+  const rlTbl = "# title\nT\n\n# slide\n\n## H\n\n| A | B |\n| - | - |\n| 1 | 2 |\n";
+  const rlCols = "# title\nТема\n\n# slide\n\n## H\n\n::: left\n\n- слева\n\n::: right\n\n- справа\n";
+  const rlEn = "# title\nDetection probe\n\n# slide\n\n## H\n\n- item\n";
+
+  const rlShiftTpl = fs.readFileSync(needPyOut("shifted_template.pptx"));
+  const rlNoCloseTpl = fs.readFileSync(needPyOut("noclose_template.pptx"));
+  const rlMovedTpl = fs.readFileSync(needPyOut("en_body_idx2_template.pptx"));
+  const rlT0Tpl = fs.readFileSync(needPyOut("ru_title_idx0_template.pptx"));
+  const rlShift = { title: "ppt/slides/slide3.xml", plan: "ppt/slides/slide4.xml",
+    content: "ppt/slides/slide5.xml", closing: "ppt/slides/slide6.xml" };
+
+  const rlBuild = await buildWith(rlSimple, rlShiftTpl);
+  check("the JS engine detects the same roles on a template opening with extra slides",
+    rolesEqual(rlBuild.d.template.roles, rlShift), j(rlBuild.d.template.roles));
+  check("buildZip hands the roles it used back to the caller (for the log and the preview)",
+    !!rlBuild.built.template && rolesEqual(rlBuild.built.template.roles, rlShift) &&
+    rlBuild.built.template.report.length > 0 &&
+    rlBuild.built.template.layouts.length > 0,
+    j(rlBuild.built.template && rlBuild.built.template.roles));
+  const rlDiffShift = await partsDiff(rlBuild.z, await load(needPyOut("shift.pptx")));
+  check("a shifted-template build is byte-identical to Python",
+    rlDiffShift.length === 0, j(rlDiffShift.slice(0, 6)));
+  const rlKept = slideNames(rlBuild.z);
+  const rlCt = await rlBuild.z.file("[Content_Types].xml").async("string");
+  check("the extra slides are dropped and every kept slide declares a content type",
+    !rlBuild.z.file("ppt/slides/slide1.xml") &&
+    !rlBuild.z.file("ppt/slides/_rels/slide2.xml.rels") &&
+    rlKept.indexOf("ppt/slides/slide3.xml") >= 0 &&
+    rlKept.every((n) => rlCt.includes('PartName="/' + n + '"')), j(rlKept));
+  check("no relationship points at a dropped slide",
+    !(await rlBuild.z.file("ppt/_rels/presentation.xml.rels").async("string"))
+      .includes('Target="slides/slide1.xml"'));
+  const rlSwap = await buildWith(rlSimple, rlShiftTpl, { plan_slide: "5", content_slide: "4" });
+  check("content_slide and plan_slide overrule the detected pair",
+    (await rlSwap.z.file("ppt/slides/slide4.xml").async("string")).includes("пункт") &&
+    (await rlSwap.z.file("ppt/slides/slide5.xml").async("string")).includes("Один"));
+  const rlSwap2 = await buildWith(rlSimple, rlShiftTpl,
+    { content_slide: "slide4.xml", plan_slide: "slide5.xml" });
+  check("a part name works as a role setting too",
+    (await rlSwap2.z.file("ppt/slides/slide4.xml").async("string")).includes("пункт"));
+  const rlNoPlan = await buildWith("# title\nТема\n\n# slide\n\n## H\n\n- пункт\n\n" +
+    "# closing\n\nКонец работы\n", rlShiftTpl);
+  check("a deck that needs no plan slide drops the plan slide and keeps the detected content",
+    !rlNoPlan.z.file("ppt/slides/slide4.xml") &&
+    rlNoPlan.d.template.roles.content === "ppt/slides/slide5.xml");
+
+  for (const [label, settings, needle] of [
+    ["a role switched off while the deck needs it", { plan_slide: "none" }, "plan_slide"],
+    ["two roles naming one slide", { closing_slide: "4" }, "same slide"],
+    ["a position outside the deck", { content_slide: "9" }, "out of range"],
+    ["a part that is not a slide", { content_slide: "no-such.xml" }, "content_slide"],
+    ["the title slide switched off", { title_slide: "none" }, "title_slide"]]) {
+    const msg = await roleErr(rlSimple, rlShiftTpl, settings);
+    check("role settings: " + label + " raises", msg.includes(needle), msg);
+  }
+
+  const rlNoclose = await buildWith(rlNoClosing, rlNoCloseTpl);
+  check("a template without a closing slide serves a deck that has none",
+    !rlNoclose.z.file("ppt/slides/slide4.xml") && rlNoclose.d.template.roles.closing === null);
+  const rlNocloseDiff = await partsDiff(rlNoclose.z, await load(needPyOut("noclose.pptx")));
+  check("and the build is byte-identical to Python", rlNocloseDiff.length === 0,
+    j(rlNocloseDiff.slice(0, 6)));
+  const rlNoCloseErr = await roleErr(rlSimple, rlNoCloseTpl);
+  check("a closing section with no closing slide names closing_slide",
+    rlNoCloseErr.includes("closing_slide") && rlNoCloseErr.includes("closing"), rlNoCloseErr);
+
+  const rlBase = await buildWith(rlTbl, tplEnBuf);
+  const rlMoved = await buildWith(rlTbl, rlMovedTpl, { body_marker: '<p:ph type="body" idx="2"/>' });
+  const rlFrameBase = await frameOf(rlBase.z), rlFrameMoved = await frameOf(rlMoved.z);
+  check("a body placeholder that is not the layout's first still drives geometry",
+    !!rlFrameMoved && !!rlFrameBase && rlFrameMoved.join() === rlFrameBase.join() &&
+    Number(rlFrameBase[2]) !== api.DEFAULT_BOX[2],
+    j([rlFrameMoved, rlFrameBase, api.DEFAULT_BOX[2]]));
+  const rlGeomDiff = await partsDiff(rlMoved.z, await load(needPyOut("geom_moved.pptx")));
+  check("the custom-marker deck is byte-identical to Python", rlGeomDiff.length === 0,
+    j(rlGeomDiff.slice(0, 6)));
+
+  const rlT0 = await buildWith(rlCols, rlT0Tpl, { title_marker: '<p:ph type="title" idx="0"/>' });
+  const rlTwo = [];
+  for (const n of slideNames(rlT0.z)) {
+    if ((await rlT0.z.file(n).async("string")).includes('sz="half"')) rlTwo.push(n);
+  }
+  check("a title placeholder carrying an idx keeps two-content detection working",
+    rlTwo.length > 0, j(rlTwo));
+  const rlT0Diff = await partsDiff(rlT0.z, await load(needPyOut("t0.pptx")));
+  check("and that build is byte-identical to Python", rlT0Diff.length === 0,
+    j(rlT0Diff.slice(0, 6)));
+
+  const rlFallback = await buildWith(rlEn, tplEnBuf, { topic_anchors: "Nowhere to be found" });
+  check("a title slide with no anchor text but a title placeholder takes the topic",
+    (await rlFallback.z.file("ppt/slides/slide1.xml").async("string"))
+      .includes("<a:t>Detection probe</a:t>"));
+  const rlFbDiff = await partsDiff(rlFallback.z, await load(needPyOut("fallback.pptx")));
+  check("and that build is byte-identical to Python", rlFbDiff.length === 0,
+    j(rlFbDiff.slice(0, 6)));
+
+  const rlDet = await api.detectTemplate(await JSZip.loadAsync(rlShiftTpl), {}, false, false);
+  check("detectTemplate reports the roles without building", rolesEqual(rlDet.auto, rlShift),
+    j(rlDet.auto));
+  check("detectTemplate lists the layouts a `layout:` line can name",
+    rlDet.layouts.length > 0 && rlDet.layouts.every((l) => typeof l.name === "string") &&
+    rlDet.layouts.some((l) => l.bodies === 2),
+    j(rlDet.layouts.map((l) => l.name + ":" + l.bodies)).slice(0, 200));
+  const rlRep = rlDet.report.join("\n");
+  check("the role report names the master, the deck position and the unused slides",
+    rlRep.includes("slideMaster1.xml") && rlRep.includes("(position 3,") &&
+    rlRep.includes("unused"), rlRep);
 
   if (failures.length) {
     console.log("FAILED: " + failures.length + " check(s)");

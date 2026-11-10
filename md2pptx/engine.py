@@ -166,6 +166,14 @@ def resolve_keywords(settings=None):
     return kw
 
 
+def body_idx(kw=None):
+    """The placeholder index the body keyword names, or None when it names
+    none (then every geometry lookup takes the template's first body
+    placeholder instead of assuming index 1)."""
+    m = re.search(r'\bidx="([0-9]+)"', (kw or DEFAULT_KEYWORDS)["body_marker"])
+    return int(m.group(1)) if m else None
+
+
 def topic_anchor(title_xml, kw=None):
     """(anchor, keep) of the first topic anchor present in the title slide;
     raises when none is found."""
@@ -177,28 +185,335 @@ def topic_anchor(title_xml, kw=None):
                      % " or ".join(repr(a) for a, _k in anchors))
 
 
-def check_template_keywords(parts, kw, need_plan, need_closing):
-    """Fail early, naming the setting to change, when a template slide lacks
-    the keyword the engine needs from it."""
+def find_topic_anchor(xml, kw=None):
+    """(anchor, keep) of the first topic anchor present in `xml`, or None."""
+    for text, keep in (kw or DEFAULT_KEYWORDS)["topic_anchors"]:
+        if text in xml:
+            return text, keep
+    return None
+
+
+def title_slot(xml, kw):
+    """How the topic line gets onto the title slide, as (needle, keep, from_marker):
+    the topic anchor the template carries, or - when the template has no anchor
+    text but does have a title placeholder - that placeholder tag, into which the
+    topic is written as a plain title. `from_marker` tells the two apart, because
+    a placeholder tag is written with set_block_paras(), not with the text-anchor
+    replacement replace_para() does. None means the template offers neither."""
+    found = find_topic_anchor(xml, kw)
+    if found:
+        return found[0], found[1], False
+    if kw["title_marker"] in xml:
+        return kw["title_marker"], False, True
+    return None
+
+
+def slide_phs(xml):
+    """Every <p:ph> tag of a slide as (tag, is_title, is_body): the structural
+    view of a slide, which is what role detection reads. It does not depend on
+    the markers the user set, so detection stays meaningful when they are
+    wrong for this template."""
+    out = []
+    for m in re.finditer(r"<p:ph\b[^>]*/?>", xml):
+        tag = m.group(0)
+        t = re.search(r'\btype="([^"]+)"', tag)
+        typ = t.group(1) if t else None
+        is_title = typ == "title"
+        is_body = (not is_title and typ in (None, "body", "obj")
+                   and 'orient="vert"' not in tag)
+        out.append((tag, is_title, is_body))
+    return out
+
+
+def slide_features(parts, name, kw):
+    """What one template slide offers the engine, as role detection sees it:
+    its topic anchor (or None), whether it has a title and a body placeholder
+    at all, and whether the exact title/body markers the engine writes into
+    are present."""
+    xml = parts[name].decode("utf-8", "replace")
+    phs = slide_phs(xml)
+    return {"file": name,
+            "pos": slide_no(name),
+            "anchor": find_topic_anchor(xml, kw),
+            "title": has_title_ph(xml, kw) or any(t for _g, t, _b in phs),
+            "body": (kw["body_marker"] in xml) or any(b for _g, _t, b in phs),
+            "title_marker": kw["title_marker"] in xml,
+            "body_marker": kw["body_marker"] in xml}
+
+
+def slide_no(name):
+    """The number N of `ppt/slides/slideN.xml`."""
+    return int(re.search(r"([0-9]+)\.xml$", name).group(1))
+
+
+def slide_order(parts, pres, pres_rels):
+    """The template's slides as part names, in the order presentation.xml
+    lists them (the order PowerPoint shows them). Parts the presentation does
+    not list are not slides of the deck and are ignored. The engine's own
+    contract numbering (title/plan/content/closing) is the slide's FILE
+    number, so detection sorts this list by file number; the presentation
+    position is only used to talk to the user."""
+    by_rid = {}
+    for tag in re.findall(r"<Relationship\b[^>]*>", pres_rels):
+        if not re.search(r'Type="[^"]*/relationships/slide"', tag):
+            continue
+        rid = re.search(r'\bId="([^"]+)"', tag)
+        tgt = re.search(r'\bTarget="([^"]*slide[0-9]+\.xml)"', tag)
+        if rid and tgt:
+            name = "ppt/slides/" + tgt.group(1).split("/")[-1]
+            if name in parts:
+                by_rid[rid.group(1)] = name
+    order, seen = [], set()
+    for tag in re.findall(r"<p:sldId\b[^>]*>", pres):
+        rid = re.search(r'\br:id="([^"]+)"', tag)
+        name = by_rid.get(rid.group(1)) if rid else None
+        if name and name not in seen:
+            seen.add(name)
+            order.append(name)
+    return order
+
+
+ROLE_SETTINGS = {"title": "title_slide", "plan": "plan_slide",
+                 "content": "content_slide", "closing": "closing_slide"}
+NO_SLIDE = "none"        # a *_slide setting that says "this template has none"
+
+
+def role_target(raw, key, order):
+    """A `*_slide` setting resolved to a slide part name: None when the
+    setting is empty (auto-detect), NO_SLIDE when it says `none`, a part name
+    when it is `slide7.xml`, or the slide at that 1-based PowerPoint position
+    when it is a number. Raises naming the setting when it points nowhere."""
+    v = (raw or "").strip().lower()
+    if not v:
+        return None
+    if v in ("none", "no", "off", "-"):
+        if key in ("title_slide", "content_slide"):
+            raise SystemExit(
+                "ERROR: %s cannot be %r: a deck always needs a title slide and "
+                "a content slide to clone" % (key, raw))
+        return NO_SLIDE
+    if re.match(r"^[0-9]+$", v):
+        n = int(v)
+        if not 1 <= n <= len(order):
+            raise SystemExit(
+                "ERROR: %s %r is out of range: this template has %d slide(s) "
+                "(positions: %s)" % (key, raw, len(order),
+                                     ", ".join("%d=%s" % (i + 1, p.split("/")[-1])
+                                               for i, p in enumerate(order))))
+        return order[n - 1]
+    name = v if "/" in v else "ppt/slides/" + v
+    if name not in order:
+        raise SystemExit(
+            "ERROR: %s %r is not a slide of this template (give a 1-based "
+            "position, or a part name such as slide%d.xml)"
+            % (key, raw, slide_no(order[0]) if order else 1))
+    return name
+
+
+def detect_roles(order, feats):
+    """The four template roles, chosen from what each slide offers — a reading
+    of the template alone, independent of which sections a given deck has:
+
+    title   the first slide carrying a topic anchor, else the first slide with
+            a title and no body that comes before any title-plus-body slide,
+            else the first slide;
+    plan    the first slide after it that has both placeholders;
+    content the next one that has both, which is the slide every other content
+            slide is cloned from (with only one such slide, it is the plan
+            slide's turn to serve);
+    closing the last remaining slide with a title and no body, else the first
+            remaining slide with a title.
+
+    This is what the engine's contract has always meant by 'the first four
+    slides', only read from the slides instead of from their file names, so a
+    template that follows the contract is detected as it always behaved. Every
+    guess can be overruled with title_slide, plan_slide, content_slide and
+    closing_slide."""
+    order = sorted(order, key=slide_no)
+    # A title-only slide counts as the cover only while no slide before it has
+    # already claimed the title-plus-body role: the cover is what comes first.
+    both = next((i for i, n in enumerate(order)
+                 if feats[n]["title"] and feats[n]["body"]), None)
+    title = (next((n for n in order if feats[n]["anchor"]), None)
+             or next((n for n in order if feats[n]["title"]
+                      and not feats[n]["body"]
+                      and (both is None or order.index(n) < both)), None)
+             or (order[0] if order else None))
+    if title is None:
+        raise SystemExit("ERROR: this template has no slides to take roles from")
+    after = order[order.index(title) + 1:]
+    cands = [n for n in after if feats[n]["title"] and feats[n]["body"]]
+    plan = content = None
+    if len(cands) >= 2:
+        plan, content = cands[0], cands[1]
+    elif cands:
+        content = cands[0]
+    used = {title, plan, content}
+    left = [n for n in after if n not in used]
+    closing = (next((n for n in reversed(left)
+                     if feats[n]["title"] and not feats[n]["body"]), None)
+               or next((n for n in left if feats[n]["title"]), None))
+    return {"title": title, "plan": plan, "content": content,
+            "closing": closing}
+
+
+def apply_role_settings(roles, settings, order):
+    """The title_slide / plan_slide / content_slide / closing_slide overrides
+    applied to a role dict, then checked: no slide may serve two roles. An
+    empty setting leaves the detected role alone; `none` switches it off."""
+    for role, key in ROLE_SETTINGS.items():
+        t = role_target((settings or {}).get(key), key, order)
+        if t is None:
+            continue
+        roles[role] = None if t == NO_SLIDE else t
+    seen = {}
+    for role in ("title", "plan", "content", "closing"):
+        n = roles.get(role)
+        if not n:
+            continue
+        if n in seen:
+            raise SystemExit(
+                "ERROR: %s and %s name the same slide (%s); a slide can serve "
+                "only one role" % (ROLE_SETTINGS[seen[n]], ROLE_SETTINGS[role],
+                                   n.split("/")[-1]))
+        seen[n] = role
+    return roles
+
+
+def resolve_roles(order, feats, settings, need_plan, need_closing):
+    """The template roles for this deck: detect_roles()'s reading of the
+    template, with each `*_slide` setting applied on top, the roles the deck
+    has no section for dropped, and the resulting conflicts reported (one
+    slide serving two roles, a role the deck needs that is missing or was
+    switched off). An explicit setting always wins; detection only fills what
+    is left to it."""
+    roles = apply_role_settings(dict(detect_roles(order, feats)), settings,
+                                order)
+    for role, need in (("plan", need_plan), ("closing", need_closing)):
+        if not need:
+            roles[role] = None
+            continue
+        if roles.get(role):
+            continue
+        key = ROLE_SETTINGS[role]
+        if (settings or {}).get(key, "").strip().lower() in ("none", "no",
+                                                              "off", "-"):
+            raise SystemExit(
+                "ERROR: %s is set to none but this deck has a '# %s' section; "
+                "delete the setting (or the section) to let the engine pick the "
+                "slide" % (key, role))
+        raise SystemExit(
+            "ERROR: this template has no %s slide to write the deck's '# %s' "
+            "section on (%s); set %s to the slide to use"
+            % (role, role,
+               "a closing slide needs at least a title placeholder"
+               if role == "closing" else
+               "a %s slide needs a title and a body placeholder" % role, key))
+    return roles
+
+
+def role_report(roles, order, feats, master):
+    """One line per role and per unused slide, as the engine reports what it
+    found: part name, PowerPoint position, file number, and why."""
+    pos = {n: i + 1 for i, n in enumerate(order)}
+    def why(n):
+        f = feats[n]
+        bits = []
+        if f["anchor"]:
+            bits.append("anchor %r" % f["anchor"][0])
+        if f["title"]:
+            bits.append("title" + ("" if f["title_marker"] else "*"))
+        if f["body"]:
+            bits.append("body" + ("" if f["body_marker"] else "*"))
+        return ", ".join(bits)
+    lines = []
+    for role in ("title", "plan", "content", "closing"):
+        n = roles.get(role)
+        lines.append("  %-8s %s (position %d, %s: %s)"
+                     % (role + ":", n.split("/")[-1], pos[n], n, why(n))
+                     if n else "  %-8s not used" % (role + ":"))
+    used = set(v for v in roles.values() if v)
+    left = [n for n in order if n not in used]
+    if left:
+        lines.append("  unused   %s (dropped from the deck)"
+                     % ", ".join(n.split("/")[-1] for n in left))
+    lines.append("  master   %s" % master.split("/")[-1])
+    return lines
+
+
+def check_template_keywords(parts, kw, roles, need_plan, need_closing):
+    """Fail early, naming the setting to change, when a slide role detection
+    picked cannot serve it."""
     tm, bm = kw["title_marker"], kw["body_marker"]
-    need = [(TITLE_SLIDE, "title slide", None),
-            (CONTENT_SLIDE, "content slide (slide3)", (tm, bm))]
+    need = [("title", "title slide", None),
+            ("content", "content slide", (tm, bm))]
     if need_plan:
-        need.append((PLAN_SLIDE, "plan slide (slide2)", (tm, bm)))
+        need.append(("plan", "plan slide", (tm, bm)))
     if need_closing:
-        need.append((CLOSE_SLIDE, "closing slide (slide4)", (tm,)))
-    for name, label, markers in need:
+        need.append(("closing", "closing slide", (tm,)))
+    for role, label, markers in need:
+        name = roles.get(role)
+        if not name:
+            raise SystemExit(
+                "ERROR: the template has no %s for this deck (no slide "
+                "matches its role); set %s to a slide that has the "
+                "placeholders, or to none to leave this slide out"
+                % (label, ROLE_SETTINGS[role]))
         xml = parts[name].decode("utf-8")
+        short = name.split("/")[-1]
         if markers is None:
-            topic_anchor(xml, kw)
+            if title_slot(xml, kw) is None:
+                raise SystemExit(
+                    "ERROR: no title-slide topic anchor found in %s (expected "
+                    "%s, or a title placeholder matching title_marker %r to "
+                    "write the topic into); set topic_anchors to the text that "
+                    "marks the topic line, or title_slide to the slide to use"
+                    % (short, " or ".join(repr(a) for a, _k in kw["topic_anchors"]),
+                       tm))
             continue
         for m in markers:
             if m not in xml:
                 key = "title_marker" if m == tm else "body_marker"
                 raise SystemExit(
-                    "ERROR: the template's %s has no placeholder matching "
-                    "%s %r; set %s to the placeholder tag it uses"
-                    % (label, key, m, key))
+                    "ERROR: the template's %s (%s) has no placeholder matching "
+                    "%s %r; set %s to the placeholder tag it uses, or %s to "
+                    "the slide to use" % (label, short, key, m, key,
+                                          ROLE_SETTINGS[role]))
+
+
+def layout_summary(parts, kw=None):
+    """What a template can do as `layout:` lines: [{name, title, bodies}] per
+    slide layout, in numeric order. A two-column slide needs one with a title
+    and two side-by-side body placeholders."""
+    return [{"name": name, "title": has_title, "bodies": len(phs)}
+            for _f, name, has_title, phs in layout_catalog(parts, kw)]
+
+
+def detect_template(template_path, settings=None, need_plan=True,
+                    need_closing=True):
+    """What a template offers, without building a deck: the roles the engine
+    would pick for a deck with these sections, the slides it would leave out,
+    the master it reads styles and geometry from, and its layouts.
+    `need_plan` / `need_closing` say which sections the deck has; the keyword
+    and `*_slide` settings may overrule the guess. Used by --detect and the
+    web app's template card."""
+    with zipfile.ZipFile(template_path, "r") as z:
+        parts = {name: z.read(name) for name in z.namelist()}
+    pres = parts["ppt/presentation.xml"].decode("utf-8")
+    pres_rels = parts["ppt/_rels/presentation.xml.rels"].decode("utf-8")
+    kw = resolve_keywords(settings)
+    order = slide_order(parts, pres, pres_rels)
+    feats = {name: slide_features(parts, name, kw) for name in order}
+    auto = detect_roles(order, feats)
+    roles = resolve_roles(order, feats, settings, need_plan, need_closing)
+    content = roles.get("content")
+    master = MASTER
+    if content and rels_name(content) in parts:
+        master = master_of(parts, parts[rels_name(content)].decode("utf-8"))
+    return {"order": list(order), "roles": roles, "auto": auto,
+            "features": feats, "master": master,
+            "layouts": layout_summary(parts, kw),
+            "report": role_report(roles, order, feats, master)}
 
 
 TITLE_PT = 36                        # fallback closing-slide title size
@@ -918,7 +1233,8 @@ def body_phs(layout_xml):
     block), ordered by idx and then left to right, top to bottom (placeholders
     that share the sentinel idx are told apart by position). Footer, date,
     slide number, picture and vertical-text placeholders are not body
-    placeholders."""
+    placeholders. A body placeholder that declares no idx carries
+    PowerPoint's default body index (1)."""
     out = []
     for sp in re.findall(r"<p:sp>.*?</p:sp>", layout_xml, re.S):
         m = re.search(r"<p:ph\b[^>]*/>", sp)
@@ -927,22 +1243,30 @@ def body_phs(layout_xml):
         tag = m.group(0)
         idx = re.search(r'\bidx="([0-9]+)"', tag)
         typ = re.search(r'\btype="([^"]+)"', tag)
-        if not idx or (typ and typ.group(1) not in ("body", "obj")):
+        if typ and typ.group(1) not in ("body", "obj"):
             continue
         if 'orient="vert"' in tag:
             continue
-        out.append((int(idx.group(1)), tag, sp_box(sp), sp))
+        out.append((int(idx.group(1)) if idx else 1, tag, sp_box(sp), sp))
     out.sort(key=lambda p: (p[0], p[2][0] if p[2] else 0, p[2][1] if p[2] else 0))
     return out
 
 
-def master_body_box(parts):
-    """The slide master's body placeholder box, the end of the geometry chain."""
-    xml = parts.get(MASTER)
+def master_body_box(parts, kw=None, master=None):
+    """The body placeholder box at the end of the geometry chain: the master
+    the content slides inherit from (see master_of), the placeholder the body
+    keyword names, else the master's first body placeholder, else
+    DEFAULT_BOX."""
+    xml = parts.get(master or MASTER)
     if xml is None:
         return DEFAULT_BOX
-    return (sp_box(sp_block(xml.decode("utf-8"), '<p:ph type="body" idx="1"/>'))
-            or DEFAULT_BOX)
+    phs = body_phs(xml.decode("utf-8"))
+    want = body_idx(kw)
+    block = next((b for i, _t, _x, b in phs
+                  if want is None or i == want), None)
+    if block is None and want is not None:
+        block = next((b for _i, _t, _x, b in phs), None)
+    return sp_box(block) or DEFAULT_BOX
 
 
 def layout_file(rels_xml):
@@ -951,29 +1275,67 @@ def layout_file(rels_xml):
     return "ppt/slideLayouts/" + m.group(1) if m else None
 
 
-def layout_body_block(parts, rels_xml, idx):
+def part_rels(name):
+    """The rels part of any package part."""
+    head, base = name.rsplit("/", 1)
+    return "%s/_rels/%s.rels" % (head, base)
+
+
+def master_of(parts, slide_rels):
+    """The slide master a slide inherits through its layout. A package may
+    carry several masters; the body geometry, theme colours and fonts must
+    come from the one the content slides actually use, not from
+    slideMaster1.xml. Falls back to MASTER when the chain is not there."""
+    lay = layout_file(slide_rels)
+    if lay:
+        rels = parts.get(part_rels(lay))
+        if rels is not None:
+            m = re.search(r'Target="[^"]*(slideMaster[0-9]+\.xml)"',
+                          rels.decode("utf-8"))
+            if m:
+                name = "ppt/slideMasters/" + m.group(1)
+                if name in parts:
+                    return name
+    return MASTER
+
+
+def layout_body_block(parts, rels_xml, idx=None):
     """The <p:sp> of the layout (named by a slide's rels) body placeholder
-    with this idx, or None."""
+    `idx`, or its first body placeholder when idx is None, or None."""
     lay = parts.get(layout_file(rels_xml) or "")
     if lay is not None:
         for i, _tag, _box, block in body_phs(lay.decode("utf-8")):
-            if i == idx:
+            if idx is None or i == idx:
                 return block
     return None
 
 
-def default_body(parts, content_xml, content_rels, kw=None):
+def default_body(parts, content_xml, content_rels, kw=None, master=None):
     """(box, layout block) of the clone prototype's body placeholder. The box
     is the slide's own geometry, else its layout's, else the master's; the
     block is the layout's placeholder (None without one)."""
     body_marker = (kw or DEFAULT_KEYWORDS)["body_marker"]
-    block = layout_body_block(parts, content_rels, 1)
+    block = layout_body_block(parts, content_rels, body_idx(kw))
     box = sp_box(sp_block(content_xml, body_marker)) or sp_box(block)
-    return box or master_body_box(parts), block
+    return box or master_body_box(parts, kw, master), block
 
 
-def layout_catalog(parts):
-    """(file, name, has_title, body_phs) of every layout, in numeric order."""
+def title_ph_re():
+    """Any title placeholder tag, the loose form of the title keyword."""
+    return re.compile(r'<p:ph\b[^>]*\btype="title"')
+
+
+def has_title_ph(xml, kw=None):
+    """True when the XML declares a title placeholder: the title keyword
+    itself, or any `<p:ph type="title" ...>` tag."""
+    return ((kw or DEFAULT_KEYWORDS)["title_marker"] in xml) or bool(
+        title_ph_re().search(xml))
+
+
+def layout_catalog(parts, kw=None):
+    """(file, name, has_title, body_phs) of every layout, in numeric order.
+    `has_title` accepts the title keyword or any title placeholder tag, so a
+    template whose title carries an idx is still a titled layout."""
     files = sorted((n for n in parts
                     if re.match(r"^ppt/slideLayouts/slideLayout[0-9]+\.xml$", n)),
                    key=lambda n: int(re.search(r"([0-9]+)\.xml$", n).group(1)))
@@ -981,7 +1343,7 @@ def layout_catalog(parts):
     for f in files:
         x = parts[f].decode("utf-8")
         nm = re.search(r'<p:cSld name="([^"]*)"', x)
-        out.append((f, nm.group(1) if nm else "", '<p:ph type="title"/>' in x,
+        out.append((f, nm.group(1) if nm else "", has_title_ph(x, kw),
                     body_phs(x)))
     return out
 
@@ -995,7 +1357,7 @@ def is_two_content(entry, master_box):
     return a[1] == b[1] and a[0] + a[2] <= b[0]
 
 
-def plan_slide(parts, default, body_pt, layout_key, ncols, kw=None):
+def plan_slide(parts, default, body_pt, layout_key, ncols, kw=None, master=None):
     """Where a slide's columns go: {"file": layout part or None for the clone
     prototype's own layout, "phs": one dict per column}. A column dict has:
 
@@ -1010,16 +1372,19 @@ def plan_slide(parts, default, body_pt, layout_key, ncols, kw=None):
                 nothing can link it to the layout placeholder
 
     `default` is default_body()'s (box, block). Each column dict also has
-    `spacing`, effective_spacing() at the column's size."""
-    master_xml = parts[MASTER].decode("utf-8") if MASTER in parts else ""
+    `spacing`, effective_spacing() at the column's size. `master` is the slide
+    master the content slides inherit from (see master_of); it defaults to the
+    classic first one."""
+    master = master or MASTER
+    master_xml = parts[master].decode("utf-8") if master in parts else ""
     if layout_key is None and ncols == 1:
         return {"file": None, "phs": [{"tag": (kw or DEFAULT_KEYWORDS)["body_marker"],
                                        "box": default[0],
                                        "pt": body_pt, "block": default[1],
                                        "orphan": False,
                                        "spacing": effective_spacing(default[1], master_xml, body_pt)}]}
-    catalog = layout_catalog(parts)
-    master_box = master_body_box(parts)
+    catalog = layout_catalog(parts, kw)
+    master_box = master_body_box(parts, kw, master)
     if layout_key is None or layout_key.lower() == "two-content":
         found = [c for c in catalog if is_two_content(c, master_box)]
         if not found:
@@ -1473,10 +1838,10 @@ def workbook_bytes(ch):
     return buf.getvalue()
 
 
-def body_color(parts):
+def body_color(parts, master=None):
     """Colour of the master's level-1 body text as an <a:solidFill> element,
     or "" when the master declares none."""
-    xml = parts.get(MASTER)
+    xml = parts.get(master or MASTER)
     if xml is None:
         return ""
     x = xml.decode("utf-8")
@@ -1490,9 +1855,9 @@ def body_color(parts):
     return f.group(0) if f else ""
 
 
-def body_font(parts):
+def body_font(parts, master=None):
     """Typeface of the master's level-1 body text, or None."""
-    xml = parts.get(MASTER)
+    xml = parts.get(master or MASTER)
     if xml is None:
         return None
     x = xml.decode("utf-8")
@@ -1667,7 +2032,8 @@ def parse_slide(body):
 
 
 FRONT_KEYS = ("body_size", "lang", "table_theme_fill", "topic_anchors",
-              "title_marker", "body_marker")
+              "title_marker", "body_marker", "title_slide", "plan_slide",
+              "content_slide", "closing_slide")
 
 
 def parse_switch(text, key):
@@ -1773,6 +2139,7 @@ def parse_md(text, defaults=None):
 
     doc = {"body_size": body_size, "TOC": TOC, "table_pt": TOC, "lang": lang,
            "table_theme_fill": table_theme_fill, "keywords": keywords,
+           "settings": settings,
            "warnings": warnings, "title": None, "plan": None, "plan_title": None, "slides": [],
            "closing": None}
     for header, body in sections:
@@ -1798,27 +2165,30 @@ def parse_md(text, defaults=None):
 
 
 # ----------------------------- template font -------------------------------
-def resolve_body_size(parts, kw=None):
+def resolve_body_size(parts, kw=None, content=None, content_rels=None):
     """Effective body font size in points of the template's content slide:
-    slide3 body placeholder -> its slide layout -> OOXML default 18 pt."""
-    xml = parts[CONTENT_SLIDE].decode("utf-8")
-    sz = placeholder_sz(xml, (kw or DEFAULT_KEYWORDS)["body_marker"])
+    its body placeholder -> the body placeholder of its slide layout (the one
+    the body keyword names, else the layout's first) -> OOXML default 18 pt.
+    `content` / `content_rels` default to the classic slide3 pair."""
+    kw = kw or DEFAULT_KEYWORDS
+    content = content or CONTENT_SLIDE
+    xml = parts.get(content)
+    if xml is None:
+        return 18
+    sz = placeholder_sz(xml.decode("utf-8"), kw["body_marker"])
     if sz:
         return sz
-    rels = parts[CONTENT_RELS].decode("utf-8")
-    m = re.search(r'Target="([^"]*slideLayout\d+\.xml)"', rels)
+    if content_rels is None:
+        rels_part = parts.get(rels_name(content))
+        content_rels = rels_part.decode("utf-8") if rels_part else ""
+    m = re.search(r'Target="([^"]*slideLayout\d+\.xml)"', content_rels)
     if m:
-        layout_name = "ppt/slideLayouts/" + m.group(1).split("/")[-1]
-        layout = parts.get(layout_name)
+        layout = parts.get("ppt/slideLayouts/" + m.group(1).split("/")[-1])
         if layout:
-            lx = layout.decode("utf-8")
-            pm = re.search(r'<p:ph[^>]*idx="1"[^>]*/>', lx)
-            if pm:
-                start = lx.rfind("<p:sp>", 0, pm.start())
-                end = lx.find("</p:sp>", pm.start())
-                sm = re.search(r'sz="(\d+)"', lx[start:end])
-                if sm:
-                    return int(sm.group(1)) // 100
+            want = body_idx(kw)
+            for idx, _tag, _box, block in body_phs(layout.decode("utf-8")):
+                if want is None or idx == want:
+                    return block_sz(block) or 18
     return 18
 
 
@@ -1829,26 +2199,35 @@ def unesc(text):
             .replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&"))
 
 
-def package_slots(parts, pres, pres_rels):
-    """Where the template's four slides sit in presentation.xml and where the
-    clones may go: ({slide file: (sldId id, rId)} for slide1..slide4,
+def package_slots(parts, pres, pres_rels, roles):
+    """Where the template's role slides sit in presentation.xml and where the
+    clones may go: ({slide file: (sldId id, rId)} for each used role slide,
     first free sldId, first free rId number, first free slide file number).
     Everything is read from the template, so a template with its own ids and
     relationships (or more parts) is cloned without collisions."""
     slots = {}
-    for n in (1, 2, 3, 4):
-        fn = "ppt/slides/slide%d.xml" % n
-        rel = re.search(r'<Relationship\b[^>]*Target="slides/slide%d\.xml"[^>]*>' % n,
-                        pres_rels)
+    for role in ("title", "plan", "content", "closing"):
+        fn = roles.get(role)
+        if not fn:
+            continue
+        rel = re.search(r'<Relationship\b[^>]*Target="[^"]*%s"[^>]*>'
+                        % re.escape(fn.split("/")[-1]), pres_rels)
         rid = re.search(r'\bId="([^"]+)"', rel.group(0)) if rel else None
         sld = (re.search(r'<p:sldId\b[^>]*\br:id="%s"[^>]*>' % re.escape(rid.group(1)), pres)
                if rid else None)
         sid = re.search(r'\bid="([0-9]+)"', sld.group(0)) if sld else None
         if not sid:
-            raise SystemExit("ERROR: template slide%d.xml is not listed in "
-                             "presentation.xml (the first four slides must be "
-                             "title, plan, content, closing)" % n)
+            raise SystemExit("ERROR: template %s is not listed in "
+                             "presentation.xml (a role slide must be a real "
+                             "slide of the deck)" % fn.split("/")[-1])
         slots[fn] = (int(sid.group(1)), rid.group(1))
+    return _package_counters(parts, pres, pres_rels, slots)
+
+
+def _package_counters(parts, pres, pres_rels, slots):
+    """(slots, first free sldId, first free rId, first free slide file number).
+    The free numbers clear every id and slide part the template already has,
+    however many of them it has."""
     sids = [int(v) for v in re.findall(r'<p:sldId\b[^>]*\bid="([0-9]+)"', pres)]
     rids = [int(v) for v in re.findall(r'\bId="rId([0-9]+)"', pres_rels)]
     files = [int(m.group(1)) for m in
@@ -1863,6 +2242,66 @@ def plan_title_text(plan_xml, kw=None):
     block = sp_block(plan_xml, (kw or DEFAULT_KEYWORDS)["title_marker"]) or ""
     text = unesc("".join(re.findall(r"<a:t>([^<]*)</a:t>", block))).strip()
     return re.sub(r"\s*\([^()]*\)\s*$", "", text).strip() or "Plan"
+
+
+# --------------------------- package hygiene --------------------------------
+SLIDE_PART = re.compile(r"^ppt/slides/slide[0-9]+\.xml$")
+
+
+def prune_slides(parts, pres_rels, ct, used):
+    """Drop the template slides this deck does not use: the extra slides a
+    custom template carries, and the role slides the deck has no section for.
+    A dropped slide takes its rels part, its [Content_Types].xml override and
+    its presentation.xml.rels entry with it, plus the notes parts only it
+    referenced, so nothing points into the package from outside."""
+    drop = [n for n in list(parts) if SLIDE_PART.match(n) and n not in used]
+    if not drop:
+        return pres_rels, ct
+    keep_notes = set()
+    for n in used:
+        rels = parts.get(rels_name(n))
+        if rels:
+            keep_notes.update("../notesSlides/" + t.split("/")[-1]
+                              for t in re.findall(r'Target="([^"]*notesSlide[0-9]+\.xml)"',
+                                                  rels.decode("utf-8", "ignore")))
+    gone = list(drop)
+    for n in drop:
+        rels = parts.get(rels_name(n))
+        if rels:
+            for t in re.findall(r'Target="([^"]*notesSlide[0-9]+\.xml)"',
+                                rels.decode("utf-8", "ignore")):
+                name = "ppt/notesSlides/" + t.split("/")[-1]
+                if name not in keep_notes and name in parts:
+                    gone.append(name)
+    for n in gone:
+        parts.pop(n, None)
+        parts.pop(rels_name(n), None)
+        short = n.split("/")[-1]
+        ct = re.sub(r'<Override PartName="/[^"]*%s"[^>]*/>' % re.escape(short), "", ct)
+        if SLIDE_PART.match(n):
+            pres_rels = re.sub(r'<Relationship\b[^>]*Target="[^"]*%s"[^>]*/>'
+                               % re.escape(short), "", pres_rels)
+    return pres_rels, ct
+
+
+SLIDE_CT = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml"
+
+
+def ensure_slide_content_types(ct, used):
+    """Declare the content type of every slide part the deck keeps.
+
+    A template whose [Content_Types].xml omits a slide (sloppy exports, or a
+    tool that stripped the override of a slide it hid) would otherwise produce
+    a package PowerPoint refuses to open. A well-formed template is left
+    untouched, so the bytes of a normal build do not change."""
+    missing = [n for n in sorted(used)
+               if SLIDE_PART.match(n)
+               and not re.search(r'<Override\b[^>]*PartName="/%s"' % re.escape(n), ct)]
+    if not missing:
+        return ct
+    add = "".join('<Override PartName="/%s" ContentType="%s"/>' % (n, SLIDE_CT)
+                  for n in missing)
+    return ct.replace("</Types>", add + "</Types>")
 
 
 # ----------------------------- engine ---------------------------------------
@@ -1880,21 +2319,38 @@ def build(structure_text, template_path, out_path, settings=None):
     pres = parts["ppt/presentation.xml"].decode("utf-8")
     pres_rels = parts["ppt/_rels/presentation.xml.rels"].decode("utf-8")
     ct = parts["[Content_Types].xml"].decode("utf-8")
-    content_xml = parts[CONTENT_SLIDE].decode("utf-8")
-    content_rels = parts[CONTENT_RELS].decode("utf-8")
-    check_template_keywords(parts, kw, doc["plan"] is not None,
-                            doc["closing"] is not None)
-    body_pt = resolve_body_size(parts, kw)
+    need_plan = doc["plan"] is not None
+    need_closing = doc["closing"] is not None
+
+    # Which template slide serves which role: detected from the slides' own
+    # placeholders, overruled by title_slide / plan_slide / content_slide /
+    # closing_slide. Nothing below assumes slide1..slide4 again.
+    order = slide_order(parts, pres, pres_rels)
+    feats = dict((name, slide_features(parts, name, kw)) for name in order)
+    roles = resolve_roles(order, feats, doc["settings"], need_plan, need_closing)
+    check_template_keywords(parts, kw, roles, need_plan, need_closing)
+    title_slide, plan_slide_part = roles["title"], roles["plan"]
+    content_slide, closing_slide = roles["content"], roles["closing"]
+    content_xml = parts[content_slide].decode("utf-8")
+    content_rels = parts[rels_name(content_slide)].decode("utf-8")
+    master = master_of(parts, content_rels)
+    doc["template"] = {"order": list(order),
+                       "roles": dict(roles),
+                       "auto": detect_roles(order, feats),
+                       "features": feats, "master": master,
+                       "report": role_report(roles, order, feats, master)}
+    body_pt = resolve_body_size(parts, kw, content_slide, content_rels)
     if doc["body_size"] is None:
         doc["body_size"] = body_pt
         doc["TOC"] = doc["table_pt"] = body_pt - 1
-    slots, next_sid, next_rid, next_file = package_slots(parts, pres, pres_rels)
-    master_xml = parts[MASTER].decode("utf-8") if MASTER in parts else ""
+    slots, next_sid, next_rid, next_file = package_slots(parts, pres, pres_rels,
+                                                          roles)
+    master_xml = parts[master].decode("utf-8") if master in parts else ""
 
     # Where each slide's columns go (layout file, placeholder tags, boxes).
     # Resolved before anything is written so a bad layout fails early.
-    default = default_body(parts, content_xml, content_rels, kw)
-    plans = [plan_slide(parts, default, body_pt, layout_key, len(columns), kw)
+    default = default_body(parts, content_xml, content_rels, kw, master)
+    plans = [plan_slide(parts, default, body_pt, layout_key, len(columns), kw, master)
              for _t, columns, layout_key in doc["slides"]]
     doc["geom"] = [[(ph["box"], ph["pt"], ph["spacing"]) for ph in plan["phs"]]
                    for plan in plans]
@@ -1925,14 +2381,14 @@ def build(structure_text, template_path, out_path, settings=None):
     # 3) rebuild sldIdLst: title, plan?, content..., closing? (closing last)
     def sld(fn):
         return '<p:sldId id="%d" r:id="%s"/>' % slots[fn]
-    sldids = [sld(TITLE_SLIDE)]
+    sldids = [sld(title_slide)]
     if doc["plan"] is not None:
-        sldids.append(sld(PLAN_SLIDE))
-    sldids.append(sld(CONTENT_SLIDE))
+        sldids.append(sld(plan_slide_part))
+    sldids.append(sld(content_slide))
     for _fn, sid, rid in clones:
         sldids.append('<p:sldId id="%d" r:id="%s"/>' % (sid, rid))
     if doc["closing"] is not None:
-        sldids.append(sld(CLOSING_SLIDE))
+        sldids.append(sld(closing_slide))
     pres = re.sub(r"<p:sldIdLst>.*?</p:sldIdLst>",
                   "<p:sldIdLst>%s</p:sldIdLst>" % "".join(sldids), pres)
 
@@ -1941,21 +2397,29 @@ def build(structure_text, template_path, out_path, settings=None):
     # 4) fill the title slide (topic line; bold, size inherited from the
     #    template; font of the original anchor run is kept). An anchor
     #    marked `keep` stays in front of the topic ("На тему: <тема>"); any
-    #    other anchor's whole line is replaced by the topic.
-    title_xml = parts[TITLE_SLIDE].decode("utf-8")
+    #    other anchor's whole line is replaced by the topic. With no anchor
+    #    text anywhere the topic goes into the title placeholder instead
+    #    (title_slot), so a template whose title slide is just a title
+    #    placeholder still works without any keyword.
+    title_xml = parts[title_slide].decode("utf-8")
     topic = doc["title"] or ""
-    anchor, keep_anchor = topic_anchor(title_xml, kw)
-    topic_text = (anchor + ": " + topic) if keep_anchor else topic
-    topic_base = first_rpr(title_xml, anchor)
+    slot, keep_anchor, from_marker = title_slot(title_xml, kw)
+    topic_text = (slot + ": " + topic) if keep_anchor else topic
+    topic_base = first_rpr(title_xml, slot)
     topic_para = ('<a:p><a:r>%s<a:t>%s</a:t></a:r>%s</a:p>'
                   % (merge_rpr(topic_base, (True, False, False), None, doc["lang"]),
                      esc(topic_text), endpara_rpr(doc["lang"])))
-    title_xml = replace_para(title_xml, anchor, topic_para)
-    parts[TITLE_SLIDE] = title_xml.encode("utf-8")
+    if from_marker:
+        # the slot is a placeholder tag, not a run of text: the topic replaces
+        # the placeholder's own paragraphs, the way every other fill writes
+        title_xml = set_block_paras(title_xml, slot, topic_para)
+    else:
+        title_xml = replace_para(title_xml, slot, topic_para)
+    parts[title_slide] = title_xml.encode("utf-8")
 
     # 5) fill the plan slide (items stamped at body_size - 1)
     if doc["plan"] is not None:
-        plan_xml = parts[PLAN_SLIDE].decode("utf-8")
+        plan_xml = parts[plan_slide_part].decode("utf-8")
         plan_title_base = first_rpr(plan_xml, title_marker)
         plan_xml = set_block_paras(
             plan_xml, title_marker,
@@ -1963,14 +2427,16 @@ def build(structure_text, template_path, out_path, settings=None):
                        base=plan_title_base, lang=doc["lang"]))
         plan_body_base = first_rpr(plan_xml, body_marker)
         plan_fix = list_fixes(
-            layout_body_block(parts, parts[rels_name(PLAN_SLIDE)].decode("utf-8"), 1),
+            layout_body_block(parts,
+                              parts[rels_name(plan_slide_part)].decode("utf-8"),
+                              body_idx(kw)),
             master_xml)
         plan_xml = set_block_paras(plan_xml, body_marker,
                                   "".join(toc_para(t, TOC, base=plan_body_base,
                                                  lang=doc["lang"], num=num,
                                                  add=plan_fix["num"][0] if num else ("", ""))
                                          for t, num in doc["plan"]))
-        parts[PLAN_SLIDE] = plan_xml.encode("utf-8")
+        parts[plan_slide_part] = plan_xml.encode("utf-8")
 
     # 6) fill the content slides (slide3 + clones, in order). Body runs
     #    inherit the template body font (no sz stamped); the original runs'
@@ -1979,12 +2445,12 @@ def build(structure_text, template_path, out_path, settings=None):
     #    charts become <p:graphicFrame> shapes below the text, table cells at
     #    the size column_flow chose, charts wired to a chart part, its
     #    embedded workbook and a slide relationship.
-    content_order = [CONTENT_SLIDE] + [fn for fn, _sid, _rid in clones]
+    content_order = [content_slide] + [fn for fn, _sid, _rid in clones]
     table_styles_xml = parts.get("ppt/tableStyles.xml", b"").decode("utf-8", "ignore")
     style_default = table_style_id(table_styles_xml)
     themed_tables = 0
-    font = body_font(parts)
-    color = body_color(parts)
+    font = body_font(parts, master)
+    color = body_color(parts, master)
     chart_no = 0
     ct_extra = ""
     for (stitle, columns, _lk), plan, fn in zip(doc["slides"], plans, content_order):
@@ -2085,14 +2551,24 @@ def build(structure_text, template_path, out_path, settings=None):
 
     # 7) fill the closing slide (title stamped at the template's declared size)
     if doc["closing"] is not None:
-        close_xml = parts[CLOSE_SLIDE].decode("utf-8")
+        close_xml = parts[closing_slide].decode("utf-8")
         close_sz = placeholder_sz(close_xml, title_marker) or TITLE_PT
         close_base = first_rpr(close_xml, title_marker)
         close_xml = set_block_paras(close_xml, title_marker,
                                     title_para(doc["closing"], sz=close_sz,
                                               base=close_base,
                                               lang=doc["lang"]))
-        parts[CLOSE_SLIDE] = close_xml.encode("utf-8")
+        parts[closing_slide] = close_xml.encode("utf-8")
+
+    # 8) drop the template slides this deck does not use, so the package holds
+    #    exactly the slides the deck shows
+    used = set(content_order) | {title_slide}
+    if doc["plan"] is not None:
+        used.add(plan_slide_part)
+    if doc["closing"] is not None:
+        used.add(closing_slide)
+    pres_rels, ct = prune_slides(parts, pres_rels, ct, used)
+    ct = ensure_slide_content_types(ct, used)
 
     # put the modified top-level parts back into `parts`
     parts["ppt/presentation.xml"] = pres.encode("utf-8")
@@ -2187,6 +2663,14 @@ def validate(out_path):
         for part in re.findall(r'<Override\b[^>]*PartName="/([^"]+)"', ct):
             if part not in names:
                 problems.append("[Content_Types].xml override %s (missing part)" % part)
+        # ...and the other way round: every slide part in the package must be
+        # declared, by an Override or by a Default mapping for .xml. A slide
+        # PowerPoint does not know the type of is a package it will not open.
+        if not re.search(r'<Default\b[^>]*Extension="xml"', ct):
+            for name in sorted(names):
+                if SLIDE_PART.match(name) and not re.search(
+                        r'<Override\b[^>]*PartName="/%s"' % re.escape(name), ct):
+                    problems.append("[Content_Types].xml: no content type for %s" % name)
     return problems
 
 
@@ -2202,7 +2686,8 @@ def parse_cli(argv):
         description="Build a .pptx from structure.md and a template.")
     ap.add_argument("structure")
     ap.add_argument("template")
-    ap.add_argument("output")
+    ap.add_argument("output", nargs="?",
+                    help="the .pptx to write (omit it with --detect)")
     ap.add_argument("--lang", help="BCP-47 proofing language, e.g. ru-RU")
     ap.add_argument("--body-size", help="body size in points (plan items, "
                     "table cells and chart text use size - 1)")
@@ -2216,6 +2701,20 @@ def parse_cli(argv):
                     "'<p:ph type=\"title\"/>'")
     ap.add_argument("--body-marker", help="body placeholder tag, e.g. "
                     "'<p:ph idx=\"1\"/>'")
+    ap.add_argument("--title-slide", help="the template slide to write the topic "
+                    "on: a 1-based position in the deck, a part name such as "
+                    "slide7.xml, or empty to detect it (default)")
+    ap.add_argument("--plan-slide", help="the template slide to write the plan "
+                    "on (same forms as --title-slide; 'none' leaves the plan "
+                    "slide out)")
+    ap.add_argument("--content-slide", help="the template slide every content "
+                    "slide is cloned from (same forms as --title-slide)")
+    ap.add_argument("--closing-slide", help="the template slide to write the "
+                    "closing on (same forms as --title-slide; 'none' leaves it "
+                    "out)")
+    ap.add_argument("--detect", action="store_true",
+                    help="report the roles, slides and layouts this structure "
+                    "would use from this template, then stop (no output file)")
     try:
         a = ap.parse_args(argv)
     except SystemExit as e:
@@ -2223,9 +2722,16 @@ def parse_cli(argv):
     settings = {"lang": a.lang, "body_size": a.body_size,
                 "table_theme_fill": a.table_theme_fill,
                 "topic_anchors": a.topic_anchors,
-                "title_marker": a.title_marker, "body_marker": a.body_marker}
-    return (a.structure, a.template, a.output,
-            {k: v for k, v in settings.items() if v})
+                "title_marker": a.title_marker, "body_marker": a.body_marker,
+                "title_slide": a.title_slide, "plan_slide": a.plan_slide,
+                "content_slide": a.content_slide,
+                "closing_slide": a.closing_slide}
+    settings = {k: v for k, v in settings.items() if v}
+    if a.detect:
+        settings["detect"] = "1"
+    if not a.output and not a.detect:
+        return None
+    return (a.structure, a.template, a.output, settings)
 
 
 def main():
@@ -2235,8 +2741,24 @@ def main():
     if cli is None:
         return 2
     struct_path, template_path, out_path, settings = cli
+    detect = settings.pop("detect", None)
     with open(struct_path, "r", encoding="utf-8-sig") as f:
         structure_text = f.read()
+
+    if detect:
+        doc = parse_md(structure_text, settings)
+        info = detect_template(template_path, doc["settings"],
+                               doc["plan"] is not None,
+                               doc["closing"] is not None)
+        print("template %s" % template_path)
+        for line in info["report"]:
+            print(line)
+        print("  layouts: %s" % ", ".join(
+            "%s (%d body placeholder(s)%s)"
+            % (lay["name"] or "?", lay["bodies"],
+               ", title" if lay["title"] else "")
+            for lay in info["layouts"]))
+        return 0
 
     doc, ncontent, body_pt = build(structure_text, template_path, out_path,
                                    settings)
@@ -2244,6 +2766,9 @@ def main():
     over = fit_check(doc)
 
     print("built %s" % out_path)
+    print("  template roles:")
+    for line in doc["template"]["report"]:
+        print(line)
     print("  slides: %d (title + %s + %d content + %s)"
           % (2 + ncontent + (1 if doc["closing"] else 0),
              ("1 plan" if doc["plan"] is not None else "no plan"),

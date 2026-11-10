@@ -64,8 +64,29 @@ and the JS engine core in `webapp/index.html`. Run from the repo root:
   and without `(keep)`, custom markers on a template copy, keywords given as
   defaults); the command-line options and a structure file saved with a
   byte-order mark.
+  Template-roles section: a template whose title, plan, content and closing
+  slides are `slide3..slide6` (two decoy showcase slides prepended, its
+  `[Content_Types].xml` deliberately stale) is detected and built with; the
+  topic, plan and content land on the detected slides; the unused slides, their
+  relationships and their stale content types are gone, and every kept slide
+  declares one; a deck with no plan section drops the plan slide; `plan_slide` /
+  `content_slide` overrule the detected pair by position and by part name; the
+  five role-setting errors (switched off while needed, two roles on one slide,
+  position out of range, a part that is not a slide, the title slide off); a
+  template with no closing slide serves a deck that needs none and names
+  `closing_slide` when the deck asks for one; a body placeholder moved to
+  `idx="2"` still gives a table the same frame as the untouched template (and
+  not the fallback box); a title placeholder carrying `idx="0"` keeps
+  two-content detection working through `title_marker`; a cover with no topic
+  anchor text takes the topic into its title placeholder; `--detect` reports the
+  roles and layouts, exits 0 and writes no file.
   Writes `out/ru_deck_py.pptx`, `out/lang_deck_py.pptx`,
-  `out/numbering_deck_py.pptx` and `out/en_deck_py.pptx` (the parity inputs).
+  `out/numbering_deck_py.pptx` and `out/en_deck_py.pptx` (the parity inputs)
+  plus `out/shifted_template.pptx`, `out/noclose_template.pptx`,
+  `out/en_body_idx2_template.pptx` and `out/ru_title_idx0_template.pptx` (the
+  role fixtures the JS suite builds against) and the role builds
+  `out/shift.pptx`, `out/noclose.pptx`, `out/geom_moved.pptx`, `out/t0.pptx`,
+  `out/fallback.pptx`.
 - `run_tests_js.js` — the same checks on the JS core extracted from
   `webapp/index.html` (including the preview's `numberLabels` and slide-size handling, and
   the same settings section as `run_tests.py`), plus byte-identical part-by-part parity against
@@ -73,7 +94,14 @@ and the JS engine core in `webapp/index.html`. Run from the repo root:
   `out/numbering_deck_py.pptx` and `out/en_deck_py.pptx` (all produced by
   `run_tests.py` — run that first). An embedded chart workbook is a zip whose
   wrapper bytes depend on the zip implementation, so workbooks are compared by
-  their entries and every other part byte for byte, in both directions. Requires Node and jszip 3.x: the Windows
-  copy path is tried first, then a plain `require("jszip")` (install jszip in
-  a `node_modules` visible from this test).
+  their entries and every other part byte for byte, in both directions.
+  The template-roles section mirrors the Python one on the same fixtures
+  (`out/shifted_template.pptx` and friends), asserts the same detections,
+  overrides, errors, pruning and geometry, and compares each resulting package
+  byte for byte against the matching Python build (`out/shift.pptx`,
+  `out/noclose.pptx`, `out/geom_moved.pptx`, `out/t0.pptx`,
+  `out/fallback.pptx`), so the two engines cannot diverge on a custom template.
+  Requires Node and jszip 3.x: the Windows copy path is tried first, then a
+  plain `require("jszip")`, and failing both the JSZip copy inlined in
+  `webapp/index.html` is loaded, so the suite runs with no install.
 - `out/` — build artifacts, regenerated on every run (do not edit).
